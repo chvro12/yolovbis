@@ -1,0 +1,33 @@
+# Copier vers providers.yaml (ou définir PARKING_PROVIDERS_YAML) et adapter.
+# Les secrets restent dans .env (voir docs/gis_providers.md).
+
+ign:
+  enabled: true
+  # URL de base des services de diffusion Géoplateforme (WFS, WMS…)
+  geoplateforme_wfs_url: "https://data.geopf.fr/wfs/ows"
+  geoplateforme_wms_raster_url: "https://data.geopf.fr/wms-r"
+  use_bdtopo: true
+  # Couches WFS BD TOPO v3 (noms exacts du GetCapabilities IGN)
+  bdtopo_buildings_typename: "BDTOPO_V3:batiment"
+  bdtopo_roads_typename: "BDTOPO_V3:troncon_de_route"
+  bdtopo_zones_typename: "BDTOPO_V3:zone_d_activite_ou_d_interet"
+  wfs_max_features: 500
+  # Cache fichiers sous <cache_dir>/ign_wfs/ (GeoJSON)
+
+osm:
+  enabled: true
+  overpass_url: "https://overpass-api.de/api/interpreter"
+
+microsoft_buildings:
+  enabled: false
+  local_path_env: "MICROSOFT_BUILDINGS_PATH"
+
+mapillary:
+  enabled: false
+  token_env: "MAPILLARY_ACCESS_TOKEN"
+  graph_api_url: "https://graph.mapillary.com"
+
+# Seuils fusion GIS → sémantique (connexion route, plafond capacité produit < 40 places)
+fusion:
+  access_distance_threshold_m: 40.0
+  max_plausible_capacity_slots: 39

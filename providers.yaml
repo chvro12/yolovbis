@@ -1,0 +1,5 @@
+# Activer Mapillary quand MAPILLARY_ACCESS_TOKEN est défini dans .env
+# (les autres clés viennent des valeurs par défaut fusionnées avec ce fichier).
+
+mapillary:
+  enabled: true

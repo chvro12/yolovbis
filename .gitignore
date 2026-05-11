@@ -1,0 +1,16 @@
+.venv/
+.DS_Store
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+out/
+data/
+.harvest_tmp/
+
+# Secrets locaux (Mapillary, ArcGIS, etc.)
+.env
+

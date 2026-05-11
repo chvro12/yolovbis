@@ -1,0 +1,28 @@
+{
+  "lat": 49.729962,
+  "lon": 1.435073,
+  "radius_m": 80,
+  "ign_wfs_reachable": false,
+  "ign_bdtopo_buildings_sample": false,
+  "ign_bdtopo_roads_sample": false,
+  "osm_highways_found": true,
+  "osm_highway_way_count": 7,
+  "osm_named_highways_sample": [
+    "Avenue des Canadiens",
+    "Grande Rue Saint-Pierre",
+    "Boulevard Industriel",
+    "Rue des Abreuvoirs"
+  ],
+  "arcgis_key_present": false,
+  "arcgis_search_ok": false,
+  "arcgis_ping": false,
+  "arcgis_sample_titles": [],
+  "microsoft_path_present": false,
+  "mapillary_token_present": false,
+  "mapillary_ping_ok": false,
+  "warnings": [
+    "ARCGIS_API_KEY non configurée — bascule IGN/OSM uniquement.",
+    "MICROSOFT_BUILDINGS_PATH non défini — pas d'empreintes Microsoft locales.",
+    "MAPILLARY_ACCESS_TOKEN non défini — pas d'images Mapillary."
+  ]
+}
