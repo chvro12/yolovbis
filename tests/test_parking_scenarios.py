@@ -15,7 +15,8 @@ import pytest
 from PIL import Image
 
 from parking_capacity.imagery_wms import OrthoChip
-from parking_capacity.parking_scenarios import analyze_parking_scenarios
+from parking_capacity.parking_scenarios import analyze_parking_scenarios, _scenario_private_marked_slots
+from parking_capacity.private_parking_area import PrivateParkingArea
 from parking_capacity.surface_classification import classify_surfaces
 
 
@@ -69,6 +70,31 @@ def test_unmarked_surface_does_not_require_separators():
     r = analyze_parking_scenarios(chip)
     # Une zone bitumée doit produire au moins une estimation
     assert r.components["unmarked_surface"] is not None
+
+
+def test_private_marked_slots_detects_painted_stalls():
+    pytest.importorskip("cv2")
+    arr = _gray_asphalt(256, 256, level=95)
+    # Marquages blancs de 8 places, dans une emprise privée bitumée.
+    for x in range(70, 190, 15):
+        arr[80:112, x : x + 2] = [235, 235, 235]
+    chip = _chip_from_array(arr, side_m=40.0)
+    mask = np.zeros((256, 256), dtype=bool)
+    mask[40:190, 40:220] = True
+    private_area = PrivateParkingArea(
+        parcel_mask=mask,
+        usable_mask=mask,
+        building_mask=None,
+        road_mask=None,
+        parcel_area_m2=900.0,
+        usable_area_m2=500.0,
+        usable_ratio=0.55,
+        source="test",
+    )
+    est = _scenario_private_marked_slots(chip, private_area=private_area, m_per_px=40.0 / 256.0)
+    assert est is not None
+    assert est.confidence in ("medium", "weak")
+    assert est.capacity_estimate is not None and est.capacity_estimate >= 7
 
 
 # -------------------------------------------------------------

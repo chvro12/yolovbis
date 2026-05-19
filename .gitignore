@@ -9,7 +9,11 @@ dist/
 build/
 out/
 data/
+datasets/
 .harvest_tmp/
+
+# Poids YOLO (télécharger localement ou via Colab)
+*.pt
 
 # Secrets locaux (Mapillary, ArcGIS, etc.)
 .env

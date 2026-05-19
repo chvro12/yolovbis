@@ -32,6 +32,29 @@ from parking_capacity.visual_evidence import compute_visual_evidence, vision_not
 logger = logging.getLogger(__name__)
 
 
+def _rotated_box_points(
+    cx: float,
+    cy: float,
+    width: float,
+    height: float,
+    angle_deg: float,
+) -> list[list[float]]:
+    """Return a four-point rotated rectangle in image pixel coordinates."""
+    import math
+
+    rad = math.radians(float(angle_deg or 0.0))
+    ux, uy = math.cos(rad), math.sin(rad)
+    vx, vy = -math.sin(rad), math.cos(rad)
+    hw = float(width) * 0.5
+    hh = float(height) * 0.5
+    pts = []
+    for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+        x = float(cx) + sx * hw * ux + sy * hh * vx
+        y = float(cy) + sx * hw * uy + sy * hh * vy
+        pts.append([round(x, 2), round(y, 2)])
+    return pts
+
+
 @dataclass
 class RowResult:
     input_address: str
@@ -139,6 +162,12 @@ class RowResult:
     parking_usability_score: Optional[float] = None
     semantic_confidence: str = "none"
     semantic_scores: dict[str, Any] = field(default_factory=dict)
+    # Phase 3 : détection places marquées
+    slots_total_count: int = 0
+    slots_filled_count: int = 0
+    slots_empty_count: int = 0
+    slot_detection_method: str = "none"
+    slot_evidence: dict[str, Any] = field(default_factory=dict)
     overall_reliability_score: Optional[float] = None
     geometric_reliability: Optional[float] = None
     osm_reliability: Optional[float] = None
@@ -148,12 +177,48 @@ class RowResult:
     label_source: Optional[str] = None
     refuse_prediction: bool = False
     refuse_prediction_reason: Optional[str] = None
+    # Best-effort estimate : valeur tentative même quand refuse=True (ne pas perdre l'info)
+    best_effort_estimate: Optional[int] = None
+    best_effort_min: Optional[int] = None
+    best_effort_max: Optional[int] = None
+    best_effort_confidence: str = "none"
+    best_effort_rationale: Optional[str] = None
+    # Cohérence primary vs best_effort : ratio + flag warning
+    capacity_divergence_ratio: Optional[float] = None
+    capacity_consistency_flag: str = "none"  # ok | low_divergence | high_divergence
+    capacity_warnings: list[str] = field(default_factory=list)
+    # Typologie site (SIRENE + OSM) — Priorité 1 du plan
+    site_typology_family: str = "unknown"
+    site_typology_label: str = ""
+    site_typology_confidence: str = "none"
+    site_typology_min: Optional[int] = None
+    site_typology_max: Optional[int] = None
+    site_typology_occupation_rate: Optional[float] = None
+    site_typology_sources: list[str] = field(default_factory=list)
+    sirene_ape_code: Optional[str] = None
+    sirene_establishment_name: Optional[str] = None
+    typology_calibrated_estimate: Optional[int] = None
+    typology_calibrated_min: Optional[int] = None
+    typology_calibrated_max: Optional[int] = None
+    typology_calibration_rationale: Optional[str] = None
     yolo_detections_count: int = 0
     gis_report: Optional[dict[str, Any]] = None
     site_type: str = "unknown"
     supporting_evidence: Optional[dict[str, Any]] = None
     parking_capacity_estimation: Optional[dict[str, Any]] = None
     vehicles_payload: Optional[dict[str, Any]] = None
+    private_garage_capacity: Optional[dict[str, Any]] = None
+    nearby_public_or_shared_parking: Optional[dict[str, Any]] = None
+    nearby_public_capacity_estimate: Optional[int] = None
+    nearby_public_capacity_min: Optional[int] = None
+    nearby_public_capacity_max: Optional[int] = None
+    nearby_public_capacity_source: Optional[str] = None
+    # Couche de cohérence : flags d'incompatibilité logique entre la prédiction
+    # et les signaux secondaires (véhicules, surface, typologie, OSM).
+    consistency_flags: list[dict[str, Any]] = field(default_factory=list)
+    consistency_high_count: int = 0
+    consistency_max_severity: str = "none"
+    consistency_needs_review: bool = False
 
     def to_flat_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -191,6 +256,14 @@ def process_address(
     visual_model_specialized_for_parking: bool = False,
     yolo_weights: Optional[Path] = None,
     providers_yaml: Optional[Path] = None,
+    vehicle_yolo_weights: Optional[Path] = None,
+    auto_download_vehicle_yolo: bool = False,
+    auto_download_aerial_yolo: bool = False,
+    use_finetuned_french_yolo: bool = False,
+    use_dota_finetuned_yolo: bool = False,
+    slot_yolo_weights: Optional[Path] = None,
+    roboflow_api_key: Optional[str] = None,
+    roboflow_model_id: Optional[str] = None,
 ) -> RowResult:
     """
     ``source_priority`` : ``hybrid`` (défaut, OSM fiable sinon image), ``aerial`` (image d'abord),
@@ -247,6 +320,29 @@ def process_address(
 
         pt_buf = buffer_point_m(g.lon, g.lat, point_buffer_m)
 
+        # === Priorité 1 : Typologie SIRENE (code APE + OSM amenity) ===
+        site_typology = None
+        try:
+            from parking_capacity.sirene_client import search_sirene
+            from parking_capacity.site_typology import classify_site
+
+            sirene = search_sirene(address, client=client, cache_dir=cache_dir)
+            if sirene.primary is not None:
+                res.sirene_ape_code = sirene.primary.ape_code
+                res.sirene_establishment_name = sirene.primary.name
+            # On classifie d'abord avec APE seul — l'amenity OSM sera ajouté plus tard si trouvé
+            site_typology = classify_site(
+                ape_code=sirene.primary.ape_code if sirene.primary else None,
+            )
+            if sirene.primary:
+                caveats.append(
+                    f"SIRENE : {sirene.primary.name} (APE {sirene.primary.ape_code}) → "
+                    f"typologie={site_typology.family}, {site_typology.expected_capacity_min}-"
+                    f"{site_typology.expected_capacity_max} places attendues"
+                )
+        except Exception as e:  # noqa: BLE001
+            caveats.append(f"SIRENE indisponible : {e}")
+
         try:
             elems, raw_osm = query_parkings(
                 g.lat,
@@ -301,6 +397,34 @@ def process_address(
         res.area_ratio_min = mn_a if mn_a > 0 else None
         res.area_ratio_max = mx_a if mx_a > 0 else None
         res.area_total_m2 = ta
+
+        # Parkings publics ou partagés voisins (hors parcelle, dans le buffer) :
+        # combine la capacité OSM taggée et l'estimation par surface pour les non-taggés.
+        # Sert à signaler le contexte quand la capacité privée est faible ou nulle.
+        if res.n_parkings_buffer_only > 0:
+            mid_b, mn_b, mx_b, ta_b = surface_capacity_range_for_untagged(
+                classified, on_parcel=False,
+            )
+            near_estimate = int(cap_b + mid_b)
+            near_min = int(cap_b + mn_b)
+            near_max = int(cap_b + mx_b)
+            res.nearby_public_capacity_estimate = near_estimate
+            res.nearby_public_capacity_min = near_min
+            res.nearby_public_capacity_max = near_max
+            res.nearby_public_capacity_source = "osm_buffer"
+            res.nearby_public_or_shared_parking = {
+                "estimate": near_estimate,
+                "min": near_min,
+                "max": near_max,
+                "source": "osm_buffer",
+                "confidence": "high" if tagged_b > 0 else "medium",
+                "n_parkings": int(res.n_parkings_buffer_only),
+                "tagged_capacity": int(cap_b),
+                "n_parkings_tagged": int(tagged_b),
+                "untagged_area_m2": round(float(ta_b), 1),
+                "untagged_estimate_mid": int(mid_b),
+                "radius_m": int(search_radius_m),
+            }
 
         try:
             ps_n, _ps_raw = query_parking_space_count(
@@ -444,13 +568,50 @@ def process_address(
             except Exception as e:  # noqa: BLE001
                 caveats.append(f"Fusion GIS : {e!s}")
 
+            # Extrait le polygone cadastral strict de l'adresse géocodée.
+            # Les véhicules / slots ne doivent pas être comptés sur voirie ou parking voisin.
+            parcelle_ring_strict: Optional[list] = None
+            if parcel_union is not None:
+                try:
+                    geom_for_ring = parcel_union
+                    if geom_for_ring.geom_type == "MultiPolygon":
+                        geom_for_ring = max(geom_for_ring.geoms, key=lambda g: g.area)
+                    if hasattr(geom_for_ring, "exterior") and geom_for_ring.exterior is not None:
+                        parcelle_ring_strict = list(geom_for_ring.exterior.coords)
+                    # Surface approximative parcelle (degrés² → m² via cosinus latitude).
+                    parcel_m2_approx = 1.0e10
+                    try:
+                        import math as _math
+                        lat_for_scale = float(g.lat or 47.0)
+                        meters_per_deg_lat = 111_320.0
+                        meters_per_deg_lon = 111_320.0 * _math.cos(_math.radians(lat_for_scale))
+                        parcel_m2_approx = float(geom_for_ring.area) * meters_per_deg_lat * meters_per_deg_lon
+                    except Exception:  # noqa: BLE001
+                        parcel_m2_approx = 1.0e10
+                    caveats.append(
+                        f"Clip véhicules/slots : parcelle cadastrale stricte ~{parcel_m2_approx:.0f} m²."
+                    )
+                except Exception:  # noqa: BLE001
+                    parcelle_ring_strict = None
+
             scenarios = analyze_parking_scenarios(
                 chip,
                 segformer_parking_mask=seg_mask,
+                yolo_vehicle_weights=vehicle_yolo_weights,
+                auto_download_yolo=auto_download_vehicle_yolo,
+                auto_download_aerial_yolo=auto_download_aerial_yolo,
+                use_finetuned_french=use_finetuned_french_yolo,
+                use_dota_finetuned=use_dota_finetuned_yolo,
+                aerial_weights_cache_dir=cache_dir,
+                parcelle_polygon_lonlat=parcelle_ring_strict,
+                vehicle_clip_polygon_lonlat=parcelle_ring_strict,
                 has_osm_capacity=has_osm_capacity,
                 gis_augmentation=gis_aug,
                 max_plausible_slots_cap=gis_cfg.max_plausible_capacity_slots,
                 site_type=res.site_type or "unknown",
+                yolo_slot_weights=slot_yolo_weights,
+                roboflow_api_key=roboflow_api_key,
+                roboflow_model_id=roboflow_model_id,
             )
             geo_analysis = scenarios.geometry
 
@@ -462,6 +623,46 @@ def process_address(
                 res.vehicle_alignment_score = vd.vehicle_alignment_score
                 res.vehicle_detection_method = vd.method
                 res.parked_vehicle_clusters = len(vd.clusters)
+
+            # Phase 3 : places marquées (pleines/vides)
+            if getattr(scenarios, "slots", None) is not None:
+                sl = scenarios.slots
+                res.slots_total_count = int(getattr(sl, "slots_total_count", 0))
+                res.slots_filled_count = int(getattr(sl, "slots_filled_count", 0))
+                res.slots_empty_count = int(getattr(sl, "slots_empty_count", 0))
+                res.slot_detection_method = str(getattr(sl, "method", "none"))
+                slot_items = []
+                for slot in list(getattr(sl, "slots", []) or [])[:500]:
+                    try:
+                        slot_items.append(
+                            {
+                                "cx": round(float(slot.cx), 2),
+                                "cy": round(float(slot.cy), 2),
+                                "width_px": round(float(slot.width_px), 2),
+                                "height_px": round(float(slot.height_px), 2),
+                                "angle_deg": round(float(slot.angle_deg), 2),
+                                "status": str(slot.status),
+                                "confidence": round(float(slot.confidence), 3),
+                                "source": str(slot.source),
+                                "polygon": _rotated_box_points(
+                                    float(slot.cx),
+                                    float(slot.cy),
+                                    float(slot.width_px),
+                                    float(slot.height_px),
+                                    float(slot.angle_deg),
+                                ),
+                            }
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+                res.slot_evidence = {
+                    "total": res.slots_total_count,
+                    "filled": res.slots_filled_count,
+                    "empty": res.slots_empty_count,
+                    "method": res.slot_detection_method,
+                    "notes": list(getattr(sl, "notes", []) or []),
+                    "detections": slot_items,
+                }
             if scenarios.semantic is not None:
                 sm = scenarios.semantic
                 res.building_area_m2 = sm.building_area_m2
@@ -577,6 +778,68 @@ def process_address(
                 res.courtyard_capacity_max = cy.capacity_max
                 res.courtyard_confidence = cy.confidence
 
+            private_modes = ("marked_slots", "unmarked_surface", "courtyard_parking")
+            private_est = None
+            private_mode = None
+            for mode in private_modes:
+                est = scenarios.components.get(mode)
+                if est is not None and est.capacity_estimate is not None and est.confidence != "none":
+                    if mode == "marked_slots" and not (
+                        isinstance(est.extras, dict) and est.extras.get("private_marked_slots")
+                    ):
+                        continue
+                    if mode in ("unmarked_surface", "courtyard_parking") and est.confidence == "weak":
+                        continue
+                    if private_est is None:
+                        private_est = est
+                        private_mode = mode
+                    elif mode == scenarios.primary_mode:
+                        private_est = est
+                        private_mode = mode
+                        break
+            private_area_debug = (
+                scenarios.private_parking_area.to_debug_dict()
+                if getattr(scenarios, "private_parking_area", None) is not None
+                else None
+            )
+            if private_est is not None:
+                res.private_garage_capacity = {
+                    "estimate": private_est.capacity_estimate,
+                    "min": private_est.capacity_min,
+                    "max": private_est.capacity_max,
+                    "source": f"private_{private_mode}",
+                    "confidence": private_est.confidence,
+                    "area": private_area_debug,
+                }
+            elif private_area_debug is not None:
+                res.private_garage_capacity = {
+                    "estimate": None,
+                    "min": None,
+                    "max": None,
+                    "source": "private_area_rejected",
+                    "confidence": "none",
+                    "area": private_area_debug,
+                }
+            # On ne remplace l'estimation OSM voisine que si rien n'a été calculé en amont
+            # (OSM = source plus fiable que la détection roadside heuristique).
+            if (
+                rs is not None
+                and rs.capacity_estimate is not None
+                and res.nearby_public_or_shared_parking is None
+            ):
+                res.nearby_public_or_shared_parking = {
+                    "estimate": rs.capacity_estimate,
+                    "min": rs.capacity_min,
+                    "max": rs.capacity_max,
+                    "source": "roadside_parking",
+                    "confidence": rs.confidence,
+                    "length_m": rs.extras.get("roadside_length_m"),
+                }
+                res.nearby_public_capacity_estimate = rs.capacity_estimate
+                res.nearby_public_capacity_min = rs.capacity_min
+                res.nearby_public_capacity_max = rs.capacity_max
+                res.nearby_public_capacity_source = "roadside_parking"
+
             res.parking_visual_mode = scenarios.primary_mode
             for note in scenarios.notes:
                 caveats.append(f"Surface : {note}")
@@ -681,7 +944,7 @@ def process_address(
             ):
                 if geom_conf_pick in ("medium", "strong"):
                     geom_conf_pick = "weak"
-        elif geo_analysis and geo_analysis.geometric_capacity_estimate:
+        elif scenarios is None and geo_analysis and geo_analysis.geometric_capacity_estimate:
             geometry_places = int(geo_analysis.geometric_capacity_estimate)
             geom_conf_pick = geo_analysis.geometry_confidence
 
@@ -721,11 +984,49 @@ def process_address(
             scenario_primary_confidence=scenario_primary_conf,
         )
         res.capacity_provenance = provenance
+        if (
+            source == "parking_geometry"
+            and marked_est is not None
+            and isinstance(marked_est.extras, dict)
+            and marked_est.extras.get("private_marked_slots")
+        ):
+            source = "private_marked_slots"
+            provenance = "priorité_aérienne:places_marquées_privées"
+            res.capacity_provenance = provenance
+        elif (
+            source == "parking_geometry"
+            and res.private_garage_capacity
+            and res.private_garage_capacity.get("source") == "private_marked_slots"
+            and res.private_garage_capacity.get("confidence") != "none"
+            and primary == res.private_garage_capacity.get("estimate")
+        ):
+            source = "private_marked_slots"
+            provenance = "priorité_aérienne:places_marquées_privées"
+            res.capacity_provenance = provenance
 
         if vision_compare and has_osm_capacity and vision_est and primary == cap_p:
             caveats.append(
                 f"Comparaison : vision SegFormer ~{vision_est.estimated_spaces} pl. vs OSM parcelle {cap_p}."
             )
+
+        if primary is None and not has_osm_capacity and res.private_garage_capacity:
+            area_info = res.private_garage_capacity.get("area") or {}
+            usable_private_m2 = float(area_info.get("usable_area_m2") or 0.0)
+            if usable_private_m2 < 80.0:
+                primary = 0
+                source = "no_private_garage_area"
+                conf = "medium" if area_info.get("source") == "cadastre_surface_gis" else "low"
+                provenance = "private_garage:surface_privee_exploitable_absente"
+                res.capacity_provenance = provenance
+                res.private_garage_capacity.update(
+                    {
+                        "estimate": 0,
+                        "min": 0,
+                        "max": 0,
+                        "source": "no_private_garage_area",
+                        "confidence": conf,
+                    }
+                )
 
         if primary is None:
             caveats.append(
@@ -763,7 +1064,7 @@ def process_address(
         elif source == "ml_regressor" and primary is not None:
             res.label_source = "model"
         elif primary is not None and (
-            source in ("parking_geometry", "vision_specialized", "vision_marked_visible")
+            source in ("parking_geometry", "private_marked_slots", "vision_specialized", "vision_marked_visible")
             or (source and source.startswith("scenario_"))
         ):
             res.label_source = "model"
@@ -788,7 +1089,7 @@ def process_address(
             parts.append("ml_regression")
         res.sources_used = "|".join(parts)
         if primary is not None:
-            if source in ("osm_parcelle", "osm_buffer", "osm_parking_space_count"):
+            if source in ("osm_parcelle", "osm_buffer", "osm_parking_space_count", "no_private_garage_area"):
                 res.min_capacity = res.max_capacity = int(primary)
             elif source in ("vision_specialized", "vision_marked_visible"):
                 res.min_capacity = max(0, int(primary * 0.7))
@@ -796,17 +1097,29 @@ def process_address(
             elif source == "ml_regressor":
                 res.min_capacity = max(0, int(primary * 0.75))
                 res.max_capacity = int(primary * 1.25) + 1
-            elif source == "parking_geometry":
+            elif source in ("parking_geometry", "private_marked_slots"):
                 if (
+                    source == "parking_geometry"
+                    and
                     geo_analysis
                     and geo_analysis.geometric_capacity_min is not None
                     and geo_analysis.geometric_capacity_max is not None
                 ):
                     res.min_capacity = int(geo_analysis.geometric_capacity_min)
                     res.max_capacity = int(geo_analysis.geometric_capacity_max)
+                elif source == "private_marked_slots" and marked_est is not None:
+                    res.min_capacity = int(marked_est.capacity_min) if marked_est.capacity_min is not None else max(0, int(primary * 0.75))
+                    res.max_capacity = int(marked_est.capacity_max) if marked_est.capacity_max is not None else int(primary * 1.25) + 1
                 else:
                     res.min_capacity = max(0, int(primary * 0.78))
                     res.max_capacity = int(primary * 1.22) + 2
+                # Cohérence : si le primary a été clampé en dessous du brut géométrique
+                # (typiquement par le plafond physique sémantique), on resserre min/max
+                # autour du primary clampé — éviter l'incohérence 39 dans [245,385].
+                if res.min_capacity is not None and res.max_capacity is not None:
+                    if int(primary) < res.min_capacity or int(primary) > res.max_capacity:
+                        res.min_capacity = max(0, int(int(primary) * 0.7))
+                        res.max_capacity = int(int(primary) * 1.3) + 2
             elif source and source.startswith("scenario_"):
                 # Fourchette du scénario si dispo
                 mode_name = source[len("scenario_"):]
@@ -887,18 +1200,27 @@ def process_address(
         res.ml_reliability = mr
         res.overall_reliability_score = ov
 
+        # === Pont sémantique : peut-on remonter une géométrie faible en estimation utile ? ===
+        # Si on a 3 signaux GIS/aérien forts (BD TOPO bâtiments + route détectée + véhicules
+        # aériens), on dispose d'une preuve d'usage parking suffisante pour ne PAS refuser.
+        gis_buildings_ok = bool(
+            scenarios and scenarios.gis_fusion and scenarios.gis_fusion.bdtopo_buildings_used
+        )
+        gis_road_ok = bool(res.road_connection_detected)
+        aerial_ok = res.vehicle_detection_method.startswith("yolo_visdrone") and res.vehicle_count >= 1
+        semantic_pont = gis_buildings_ok and gis_road_ok and aerial_ok and res.parking_usability_score and res.parking_usability_score >= 40.0
+
         refuse = False
         rreason: list[str] = []
         if ov < 22.0 and primary is None:
-            # déjà aucun primary : pas besoin de refuse, mais on garde la trace.
             pass
         if (
             primary is not None
             and source == "parking_geometry"
             and geom_conf_pick == "weak"
             and not has_osm_capacity
+            and not semantic_pont
         ):
-            # Géométrie weak sans OSM : on garde la valeur comme hint, pas comme primary fiable.
             refuse = True
             rreason.append("geometrie_faible_sans_osm_capacity")
             rreason.append("surface_garable_non_isolee_certitude_insuffisante")
@@ -926,12 +1248,340 @@ def process_address(
         ):
             refuse = True
             rreason.append("aucune_preuve_visuelle_fiable")
+        # Calcul du best_effort_estimate (toujours, qu'on refuse ou non).
+        # Différencie sites haute / basse densité pour éviter sur-estimation sur sites ruraux
+        # où l'asphalte est confondue avec gravier/herbe.
+        ceiling = res.plausible_capacity_ceiling
+        floor_v = max(0, int(res.observed_vehicle_floor or 0))
+        align = float(res.vehicle_alignment_score or 0)
+        low_density = floor_v < 10 and align < 0.20
+
+        if ceiling is not None and ceiling > 0:
+            ceiling_eff = max(int(ceiling), floor_v)
+
+            if low_density:
+                # Site faible densité : pas de structure parking observée + peu de véhicules.
+                # On considère deux possibilités :
+                #   - petit parking faiblement occupé (ex. clinique rurale)
+                #   - grand parking dont les voitures sont hors clip parcelle
+                # Fourchette large pour assumer l'ambiguïté.
+                be_min = max(1, floor_v)
+                be_est = max(floor_v * 2, 8)
+                be_est = min(be_est, ceiling_eff)
+                be_est = max(be_est, be_min)
+                be_max = ceiling_eff
+                res.best_effort_rationale = (
+                    f"low_density: vehicles={floor_v}, alignment={align:.2f}, "
+                    f"fourchette_large_ambiguïté"
+                )
+                res.capacity_warnings.append(
+                    f"low_density_site (vehicles={floor_v}, alignment={align:.2f}) — "
+                    f"fourchette élargie {be_min}-{be_max}"
+                )
+            else:
+                # Haute densité : structure parking observée, on fait confiance au ceiling.
+                be_est = max(int(floor_v * 1.4), int(ceiling_eff * 0.6))
+                be_est = max(min(be_est, ceiling_eff), floor_v)
+                be_min = max(floor_v, int(ceiling_eff * 0.4))
+                be_min = min(be_min, be_est)
+                be_max = max(ceiling_eff, be_est)
+                res.best_effort_rationale = (
+                    "plafond_physique=" + str(int(ceiling_eff))
+                    + (f"+vehicles={floor_v}" if floor_v else "")
+                )
+
+            res.best_effort_estimate = int(be_est)
+
+            # === Typologie SIRENE/OSM : recalibrage best_effort ===
+            if site_typology is not None and site_typology.confidence != "none":
+                from parking_capacity.site_typology import apply_typology_to_estimate
+
+                res.site_typology_family = site_typology.family
+                res.site_typology_label = site_typology.label
+                res.site_typology_confidence = site_typology.confidence
+                res.site_typology_min = site_typology.expected_capacity_min
+                res.site_typology_max = site_typology.expected_capacity_max
+                res.site_typology_occupation_rate = site_typology.expected_occupation_rate
+                res.site_typology_sources = list(site_typology.sources)
+
+                tc_est, tc_min, tc_max, tc_rationale = apply_typology_to_estimate(
+                    site_typology,
+                    vehicle_count=floor_v,
+                    plausible_ceiling=ceiling_eff,
+                )
+                if tc_est is not None:
+                    res.typology_calibrated_estimate = tc_est
+                    res.typology_calibrated_min = tc_min
+                    res.typology_calibrated_max = tc_max
+                    res.typology_calibration_rationale = tc_rationale
+                    # On préfère la calibration typologie dans le best_effort si confiance medium+
+                    if site_typology.confidence in ("medium", "strong"):
+                        old_be = res.best_effort_estimate
+                        res.best_effort_estimate = int(tc_est)
+                        res.best_effort_min = int(tc_min)
+                        res.best_effort_max = int(tc_max)
+                        res.best_effort_confidence = (
+                            "medium" if site_typology.confidence == "strong" else "weak"
+                        )
+                        res.best_effort_rationale = (
+                            f"typology[{site_typology.family},{site_typology.confidence}]: "
+                            f"{tc_rationale} | replaced previous best={old_be}"
+                        )
+                        caveats.append(
+                            f"Typologie SIRENE : best_effort recalibré de {old_be} → {tc_est} "
+                            f"(typologie {site_typology.family} {tc_min}-{tc_max})"
+                        )
+            res.best_effort_min = int(be_min)
+            res.best_effort_max = int(be_max)
+            res.best_effort_confidence = "weak"
+
         if refuse and primary is not None:
             res.refuse_prediction = True
             res.refuse_prediction_reason = "; ".join(rreason)
             res.estimated_capacity = None
+            res.min_capacity = None
+            res.max_capacity = None
+            res.primary_capacity = None
             res.primary_confidence = "low_confidence"
-            caveats.append("Prédiction refusée : " + res.refuse_prediction_reason)
+            caveats.append("Prédiction refusée : " + res.refuse_prediction_reason
+                           + " | best_effort=" + str(res.best_effort_estimate))
+
+        # === Cohérence primary vs best_effort ===
+        # Sur sites urbains denses, le primary peut être faible (cour exiguë) alors que le
+        # best_effort (basé sur véhicules) est très haut (rue + voisins). On signale.
+        if (
+            res.estimated_capacity is not None and res.estimated_capacity > 0
+            and res.best_effort_estimate is not None and res.best_effort_estimate > 0
+        ):
+            ratio = float(res.best_effort_estimate) / float(res.estimated_capacity)
+            inv_ratio = 1.0 / ratio if ratio > 0 else 0.0
+            div = max(ratio, inv_ratio)
+            res.capacity_divergence_ratio = round(div, 2)
+            if div >= 3.0:
+                res.capacity_consistency_flag = "high_divergence"
+                res.capacity_warnings.append(
+                    f"divergence_primary_vs_best_effort_x{div:.1f}_"
+                    f"(primary={res.estimated_capacity}, best_effort={res.best_effort_estimate})"
+                )
+                if res.primary_confidence not in ("low_confidence", "low"):
+                    res.primary_confidence = "low"
+                if res.best_effort_confidence in ("medium", "high"):
+                    res.best_effort_confidence = "weak"
+
+                # === Promotion best_effort → primary ===
+                # Si la divergence vient d'un primary trop faible (cour exiguë alors que la zone
+                # contient un vrai parking visible), on promeut best_effort comme primary.
+                # Conditions cumulatives :
+                #   - véhicules nombreux (≥ 10) : preuve empirique forte d'usage parking
+                #   - alignement véhicules ≥ 0.25 : structure de rangées détectée
+                #   - parking_outside_buildings_ratio ≥ 0.5 : zone bitumée majoritairement utile
+                #   - best_effort > primary (on promeut vers le haut, pas l'inverse)
+                if (
+                    res.best_effort_estimate > res.estimated_capacity
+                    and res.vehicle_count >= 10
+                    and (res.vehicle_alignment_score or 0) >= 0.25
+                    and (res.parking_outside_buildings_ratio or 0) >= 0.5
+                    and not (
+                        res.private_garage_capacity
+                        and res.private_garage_capacity.get("estimate") is not None
+                        and res.private_garage_capacity.get("confidence") in ("weak", "medium", "strong", "high")
+                    )
+                ):
+                    promoted = res.best_effort_estimate
+                    promoted_min = res.best_effort_min
+                    promoted_max = res.best_effort_max
+                    old_primary = res.estimated_capacity
+                    res.estimated_capacity = int(promoted)
+                    res.primary_capacity = int(promoted)
+                    res.min_capacity = int(promoted_min) if promoted_min is not None else None
+                    res.max_capacity = int(promoted_max) if promoted_max is not None else None
+                    res.primary_source = "best_effort_promoted"
+                    res.primary_confidence = "low"
+                    res.capacity_provenance = (
+                        f"promotion_best_effort: vehicles={res.vehicle_count}, "
+                        f"alignment={res.vehicle_alignment_score:.2f}, "
+                        f"old_primary={old_primary}"
+                    )
+                    res.capacity_warnings.append(
+                        f"promoted_best_effort_to_primary "
+                        f"(était {old_primary} → {promoted})"
+                    )
+                    # La divergence est résolue : on recalcule
+                    res.capacity_divergence_ratio = 1.0
+                    res.capacity_consistency_flag = "ok_after_promotion"
+            elif div >= 1.8:
+                res.capacity_consistency_flag = "low_divergence"
+                res.capacity_warnings.append(
+                    f"divergence_modérée_x{div:.1f}"
+                )
+            else:
+                res.capacity_consistency_flag = "ok"
+
+        # === Fix 1 — Détection "pas de parking privé" sur sites urbains denses ===
+        # Si le ratio de surface garable hors bâtiment est faible ET pas de signaux forts de
+        # vraie structure parking → on conclut que la parcelle n'a pas de parking dédié.
+        # Les véhicules détectés sont alors probablement sur la voirie publique adjacente.
+        ratio_outside = res.parking_outside_buildings_ratio or 0.0
+        usability = res.parking_usability_score or 0.0
+        align = res.vehicle_alignment_score or 0.0
+        private_capacity_signal = False
+        if res.private_garage_capacity:
+            try:
+                private_est = int(res.private_garage_capacity.get("estimate") or 0)
+            except Exception:
+                private_est = 0
+            private_src = str(res.private_garage_capacity.get("source") or "")
+            private_conf = str(res.private_garage_capacity.get("confidence") or "none")
+            # Le signal "parking privé observé" doit empêcher la logique residential_dense
+            # de forcer 0 *même* en confiance basse, dès lors que l'estimation est non-triviale.
+            # Avant : seules les confidences medium+ comptaient, ce qui ratait les cas où le
+            # détecteur de places marquées trouve un parking réel mais avec peu de preuves
+            # (typique des petits sites rurale : 6-18 places, parking visible mais sans
+            # marquage net). Ces cas étaient écrasés à 0 par residential_dense.
+            private_capacity_signal = (
+                private_est > 0
+                and private_src in ("private_marked_slots", "private_unmarked_surface", "private_courtyard_parking")
+                and (
+                    private_conf in ("medium", "strong", "high")
+                    or (private_conf == "weak" and private_est >= 5)
+                )
+            )
+        # Fenêtre 0.50-0.70 : assez de densité bâtie pour suspecter "pas de parking dédié"
+        # MAIS pas trop étroite (< 0.50 = vraie cour intérieure type Paris Banque).
+        no_dedicated_parking = (
+            0.50 < ratio_outside <= 0.70
+            and usability < 48
+            and res.vehicle_count <= 5
+            and not has_osm_capacity
+            and not private_capacity_signal
+        )
+        if no_dedicated_parking and res.estimated_capacity not in (None, 0):
+            old = res.estimated_capacity
+            res.estimated_capacity = 0
+            res.min_capacity = 0
+            res.max_capacity = 0
+            res.best_effort_estimate = 0
+            res.best_effort_min = 0
+            res.best_effort_max = 0
+            res.primary_source = "no_private_parking_detected"
+            res.primary_confidence = "medium"
+            res.capacity_provenance = (
+                f"urban_dense_no_dedicated_parking: ratio_outside={ratio_outside:.2f}, "
+                f"usability={usability:.0f}, vehicles={res.vehicle_count}"
+            )
+            res.capacity_warnings.append(
+                f"forced_zero_no_dedicated_parking (était {old} → 0, voirie publique probable)"
+            )
+            res.refuse_prediction = False
+            res.refuse_prediction_reason = None
+
+        # === Fix 4 — Détection "site résidentiel dense" (vétérinaire à domicile) ===
+        # Quand SIRENE confirme un vétérinaire mais le site est en réalité une maison
+        # individuelle dans un lotissement (typique vétérinaire à domicile / cabinet personnel),
+        # le système surestime parce que typology dit "vet_clinic 3-20 places".
+        #
+        # Signaux : grand nombre de bâtiments + taille moyenne faible = quartier résidentiel.
+        # On force alors estimated_capacity = 0 (pas de parking commercial dédié).
+        building_count = 0
+        avg_building_size_m2 = 0.0
+        gis_debug = res.raw_debug.get("gis_fusion") if isinstance(res.raw_debug, dict) else None
+        if isinstance(gis_debug, dict):
+            building_count = int(gis_debug.get("ign_bdtopo_buildings") or 0)
+        if res.building_area_m2 and building_count > 0:
+            avg_building_size_m2 = float(res.building_area_m2) / float(building_count)
+
+        # Échappatoire : si véhicules nombreux ET bien alignés, c'est probablement un vrai
+        # parking commercial même en zone résidentielle dense (cas Auray vs Freyming).
+        strong_parking_evidence = (
+            res.vehicle_count >= 15
+            and (res.vehicle_alignment_score or 0) >= 0.55
+        )
+        residential_neighborhood = (
+            building_count >= 25
+            and 0 < avg_building_size_m2 <= 200
+            and not has_osm_capacity
+            and not strong_parking_evidence
+            and not private_capacity_signal
+        )
+        # Trigger si soit estimated > 0, soit best_effort > 5 (cas où refus mais best_effort
+        # encore exposé à tort comme parking théorique)
+        cur_est = res.estimated_capacity or 0
+        cur_be = res.best_effort_estimate or 0
+        if residential_neighborhood and (cur_est > 0 or cur_be > 5):
+            res.estimated_capacity = 0
+            res.min_capacity = 0
+            res.max_capacity = 0
+            res.best_effort_estimate = 0
+            res.best_effort_min = 0
+            res.best_effort_max = 0
+            res.primary_source = "residential_dense_no_dedicated_parking"
+            res.primary_confidence = "medium"
+            res.primary_capacity = 0
+            res.capacity_provenance = (
+                f"residential_neighborhood_detected: "
+                f"{building_count} bâtiments, ~{avg_building_size_m2:.0f} m² moyen "
+                f"(vétérinaire à domicile probable)"
+            )
+            res.capacity_warnings.append(
+                f"forced_zero_residential_dense (était est={cur_est}, be={cur_be} → 0, "
+                f"{building_count} bâtiments × {avg_building_size_m2:.0f} m² = résidentiel)"
+            )
+            res.refuse_prediction = False
+            res.refuse_prediction_reason = None
+
+        # === Fix 3 — Clamp par typologie : si estimation > 1.4 × max typologique ===
+        # Cas Saint-Estève : vet_clinic max=20, estimated=38 → clamp à 20.
+        # Évite que le geometric scenario sorte des chiffres aberrants pour des typologies
+        # avec une fourchette physique connue.
+        if (
+            res.site_typology_confidence in ("medium", "strong")
+            and res.site_typology_max is not None
+            and res.estimated_capacity is not None
+            and res.estimated_capacity > int(res.site_typology_max * 1.4)
+            and res.primary_source != "private_marked_slots"
+        ):
+            old = res.estimated_capacity
+            res.estimated_capacity = int(res.site_typology_max)
+            res.max_capacity = int(res.site_typology_max)
+            if res.min_capacity is not None and res.min_capacity > res.site_typology_max:
+                res.min_capacity = max(1, int(res.site_typology_max * 0.6))
+            res.primary_confidence = "low"  # marque l'ajustement
+            res.capacity_warnings.append(
+                f"typology_clamp ({res.site_typology_family} max={res.site_typology_max}, "
+                f"était {old} → {res.estimated_capacity})"
+            )
+
+        # === Fix 2 — Typology=unknown : ne pas écraser best_effort par low_density agressif ===
+        # Quand SIRENE n'a pas matché ET le site a des signaux clairs de vrai parking
+        # (asphalte hors bâti élevé + véhicules visibles), on garde un best_effort cohérent
+        # avec le plafond physique au lieu de la formule low_density.
+        if (
+            res.site_typology_confidence == "none"
+            and ratio_outside >= 0.78
+            and res.vehicle_count >= 2
+            and not no_dedicated_parking
+            and res.plausible_capacity_ceiling
+            and res.plausible_capacity_ceiling > 0
+        ):
+            ceiling_eff = max(int(res.plausible_capacity_ceiling), int(res.vehicle_count))
+            # Estimation : plus généreuse que low_density classique
+            be_est_new = max(int(res.vehicle_count * 2), int(ceiling_eff * 0.6))
+            be_est_new = min(be_est_new, ceiling_eff)
+            be_min_new = max(int(res.vehicle_count), int(ceiling_eff * 0.4))
+            be_max_new = ceiling_eff
+            be_min_new = min(be_min_new, be_est_new)
+            old_be = res.best_effort_estimate
+            res.best_effort_estimate = int(be_est_new)
+            res.best_effort_min = int(be_min_new)
+            res.best_effort_max = int(be_max_new)
+            res.best_effort_rationale = (
+                f"typology_unknown_strong_signals: vehicles={res.vehicle_count}, "
+                f"ratio_outside={ratio_outside:.2f}, ceiling={ceiling_eff} "
+                f"(était {old_be} → {be_est_new})"
+            )
+            res.capacity_warnings.append(
+                f"best_effort_recalibré_typology_unknown (était {old_be} → {be_est_new})"
+            )
 
         efc = "none"
         if res.vehicle_count > 0:
@@ -956,6 +1606,30 @@ def process_address(
             "effect_on_capacity": "none",
             "effect_on_confidence": efc,
         }
+        if scenarios and scenarios.vehicles is not None:
+            vehicle_items = []
+            for veh in list(getattr(scenarios.vehicles, "vehicles", []) or [])[:500]:
+                try:
+                    vehicle_items.append(
+                        {
+                            "cx": round(float(veh.cx), 2),
+                            "cy": round(float(veh.cy), 2),
+                            "width_px": round(float(veh.width_px), 2),
+                            "height_px": round(float(veh.height_px), 2),
+                            "angle_deg": round(float(veh.angle_deg), 2),
+                            "confidence": round(float(veh.confidence), 3),
+                            "polygon": _rotated_box_points(
+                                float(veh.cx),
+                                float(veh.cy),
+                                float(veh.width_px),
+                                float(veh.height_px),
+                                float(veh.angle_deg),
+                            ),
+                        }
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+            res.vehicles_payload["detections"] = vehicle_items
         hyp: Optional[str] = None
         if scenarios and scenarios.components.get("unmarked_surface"):
             um0 = scenarios.components["unmarked_surface"]
@@ -981,10 +1655,38 @@ def process_address(
             "max_capacity": res.max_capacity,
             "hypothesis_m2_per_space": hyp,
             "usable_parking_area_m2": scenarios.fusion_usable_parking_area_m2 if scenarios else None,
+            "private_usable_parking_area_m2": (
+                (res.private_garage_capacity or {}).get("area", {}).get("usable_area_m2")
+                if res.private_garage_capacity
+                else None
+            ),
             "linear_parking_length_m": res.roadside_length_m,
             "exclusions_summary": " ; ".join(excl_parts) if excl_parts else None,
             "site_type": res.site_type,
+            "private_garage_capacity": res.private_garage_capacity,
+            "nearby_public_or_shared_parking": res.nearby_public_or_shared_parking,
         }
+
+        # Couche de cohérence : exécutée en toute fin, après les corrections forcées
+        # (no_dedicated_parking, residential_dense, typology_clamp). Les flags se basent
+        # donc sur l'estimation finale exposée au consommateur.
+        try:
+            from parking_capacity.consistency_checks import (
+                run_consistency_checks,
+                summarize_flags,
+            )
+
+            _flags = run_consistency_checks(res)
+            _summary = summarize_flags(_flags)
+            res.consistency_flags = _summary["flags"]
+            res.consistency_high_count = _summary["high_count"]
+            res.consistency_max_severity = _summary["max_severity"]
+            res.consistency_needs_review = _summary["needs_review"]
+            for f in _flags:
+                if f.severity in ("high", "medium"):
+                    caveats.append(f"consistency[{f.severity}/{f.name}]: {f.reason}")
+        except Exception as e:  # noqa: BLE001
+            caveats.append(f"consistency_checks_error: {e!s}")
 
         res.warnings = "; ".join(caveats)
         res.caveats = "; ".join(caveats)

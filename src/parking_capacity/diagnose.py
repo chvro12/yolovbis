@@ -159,6 +159,14 @@ def run_diagnose_address(
     visual_model_specialized_for_parking: bool = False,
     yolo_weights: Optional[Path] = None,
     providers_yaml: Optional[Path] = None,
+    vehicle_yolo_weights: Optional[Path] = None,
+    auto_download_vehicle_yolo: bool = False,
+    auto_download_aerial_yolo: bool = False,
+    use_finetuned_french_yolo: bool = False,
+    use_dota_finetuned_yolo: bool = False,
+    slot_yolo_weights: Optional[Path] = None,
+    roboflow_api_key: Optional[str] = None,
+    roboflow_model_id: Optional[str] = None,
 ) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -197,6 +205,14 @@ def run_diagnose_address(
             visual_model_specialized_for_parking=visual_model_specialized_for_parking,
             yolo_weights=yolo_weights,
             providers_yaml=providers_yaml,
+            vehicle_yolo_weights=vehicle_yolo_weights,
+            auto_download_vehicle_yolo=auto_download_vehicle_yolo,
+            auto_download_aerial_yolo=auto_download_aerial_yolo,
+            use_finetuned_french_yolo=use_finetuned_french_yolo,
+            use_dota_finetuned_yolo=use_dota_finetuned_yolo,
+            slot_yolo_weights=slot_yolo_weights,
+            roboflow_api_key=roboflow_api_key,
+            roboflow_model_id=roboflow_model_id,
         )
     finally:
         if own_client:

@@ -136,6 +136,19 @@ def format_run_address_pretty(row: RowResult) -> str:
         "=== Capacité théorique (parking_capacity_estimation) ===",
         f"Capacité publiée (retenue) : {est_s} places",
         f"Fourchette : {fork} places",
+        f"Best effort (tentative) : "
+        f"{row.best_effort_estimate if row.best_effort_estimate is not None else '—'} places "
+        f"({row.best_effort_min}-{row.best_effort_max}) — "
+        f"conf={row.best_effort_confidence}, raison={row.best_effort_rationale or '—'}",
+        f"Cohérence primary↔best_effort : {row.capacity_consistency_flag} "
+        f"(ratio={row.capacity_divergence_ratio})",
+        f"Typologie SIRENE : {row.site_typology_label or '—'} "
+        f"({row.site_typology_family}, conf={row.site_typology_confidence}) — "
+        f"fourchette {row.site_typology_min}-{row.site_typology_max} places, "
+        f"occupation typique {row.site_typology_occupation_rate}",
+        f"  APE : {row.sirene_ape_code or '—'} | nom : {row.sirene_establishment_name or '—'}",
+        f"  Calibration : {row.typology_calibrated_estimate} "
+        f"({row.typology_calibrated_min}-{row.typology_calibrated_max}) — {row.typology_calibration_rationale or '—'}",
         f"Méthode : {_method_fr(row.method_used)}",
         f"Capacité théorique brute (hors refus) : {row.primary_capacity if row.primary_capacity is not None else '—'} places",
         f"Site (calage ratios) : {getattr(row, 'site_type', 'unknown')}",
@@ -150,6 +163,9 @@ def format_run_address_pretty(row: RowResult) -> str:
         f"Comptage observé (métadonnée) : {row.observed_vehicle_floor} | Plafond physique : {row.plausible_capacity_ceiling}",
         f"Parking usability score : {row.parking_usability_score or 0:.0f}/100 "
         f"({row.semantic_confidence})",
+        f"Places marquées (Phase 3) : total={row.slots_total_count} "
+        f"(pleines={row.slots_filled_count}, vides={row.slots_empty_count}) "
+        f"— méthode : {row.slot_detection_method}",
         "",
         "=== Surface classifiée ===",
         f"Asphalte : {row.asphalt_likelihood:.0%} | Toit : {row.roof_likelihood:.0%} | "

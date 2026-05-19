@@ -272,8 +272,22 @@ def compute_semantic_context(
         int(parking_outside_area_m2 / M2_PER_SPACE_PHYSICAL_MIN)
         if parking_outside_area_m2 > 20.0 else None
     )
+    # Plafond produit configurable : sert de cap maximum pour petits commerces.
+    # Le cap dur (par défaut 39) protège les petites surfaces où l'estimation surface/12 m²
+    # explose à cause de bruit de segmentation. Mais sur une grande parcelle réelle, le cap
+    # dur écrasait les estimations légitimes (ex: clinique vétérinaire à 80 places réduite à 39).
+    # On élève donc le cap à la valeur cohérente avec la surface utile (1 place / 25 m²),
+    # qui est elle-même bornée par le ceiling géométrique 1/12 m². Au final :
+    #     - petite surface (< ~975 m²) : cap = max_plausible_slots_cap (39)
+    #     - grande surface : cap suit la surface mesurée
+    # Si l'observation véhicules dépasse, elle prime (preuve directe).
     if plausible_ceiling is not None and max_plausible_slots_cap >= 0:
-        plausible_ceiling = min(plausible_ceiling, int(max_plausible_slots_cap))
+        surface_implied_cap = int(parking_outside_area_m2 / M2_PER_SPACE_PHYSICAL_TYP)
+        effective_cap = max(int(max_plausible_slots_cap), surface_implied_cap)
+        capped = min(plausible_ceiling, effective_cap)
+        plausible_ceiling = max(capped, int(observed_floor))
+    elif plausible_ceiling is not None:
+        plausible_ceiling = max(plausible_ceiling, int(observed_floor))
 
     # Score sémantique
     evidence = SemanticEvidence(

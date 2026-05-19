@@ -20,6 +20,11 @@ from parking_capacity.parking_geometry import (
     analyze_parking_geometry,
     merge_geometry_analyses,
 )
+from parking_capacity.private_parking_area import (
+    PrivateParkingArea,
+    compute_private_parking_area,
+    lonlat_polyline_to_pixels,
+)
 from parking_capacity.semantic_layer import (
     SemanticContext,
     clamp_capacity_to_semantic_bounds,
@@ -83,11 +88,13 @@ class MultiScenarioResult:
     notes: List[str] = field(default_factory=list)
     vehicles: Optional[VehicleDetectionResult] = None
     semantic: Optional[SemanticContext] = None
+    slots: Optional["object"] = None  # type: SlotDetectionResult, import circulaire évité
     gis_fusion: Optional[GisFusionResult] = None
     fusion_excluded_building_area_m2: Optional[float] = None
     fusion_usable_parking_area_m2: Optional[float] = None
     fusion_final_candidate_area_m2: Optional[float] = None
     fusion_final_parking_candidate_mask: Optional[np.ndarray] = None
+    private_parking_area: Optional[PrivateParkingArea] = None
 
 
 # -----------------------------
@@ -100,6 +107,7 @@ def _scenario_marked_slots(
     *,
     segformer_mask: Optional[np.ndarray],
     m_per_px: float,
+    private_candidate_mask: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[ScenarioEstimate], Optional[GeometryParkingAnalysis]]:
     """Délègue à la chaîne géométrique avec roof_mask + cap longueur, puis applique un
     sanity-check par densité : si capacité / surface éligible < ~15 m²/place, on dégrade
@@ -138,7 +146,15 @@ def _scenario_marked_slots(
     # Sanity-check 1 : densité (m² par place estimée) vs surface bitumée éligible.
     # Une place de parking marquée occupe **avec circulation** ~22-32 m². En dessous c'est
     # implausible (on a compté des bordures de toits / voirie comme rangées).
-    eligible_m2 = float(surface.parking_eligible_mask.sum()) * (m_per_px ** 2)
+    sanity_mask = (
+        private_candidate_mask.astype(bool)
+        if private_candidate_mask is not None and private_candidate_mask.shape == surface.parking_eligible_mask.shape
+        else surface.parking_eligible_mask
+    )
+    eligible_m2 = float(sanity_mask.sum()) * (m_per_px ** 2)
+    if private_candidate_mask is not None and cap > 0 and eligible_m2 < max(80.0, cap * 12.0):
+        sanity_notes.append(f"surface_privee_insuffisante_{eligible_m2:.1f}m2")
+        return None, geo
     if eligible_m2 > 50.0 and cap > 0:
         m2_per_space = eligible_m2 / cap
         if m2_per_space < 10.0:
@@ -190,11 +206,159 @@ def _scenario_marked_slots(
             "repeated_pattern_score": geo.repeated_pattern_score,
             "estimated_row_orientation_deg": geo.estimated_row_orientation_deg,
             "eligible_area_m2": round(eligible_m2, 1),
+            "private_candidate_mask_used": private_candidate_mask is not None,
             "m2_per_estimated_space": round(eligible_m2 / max(cap, 1), 1) if eligible_m2 > 0 else None,
             "sanity_notes": sanity_notes,
         },
     )
     return est, geo
+
+
+def _scenario_private_marked_slots(
+    chip: OrthoChip,
+    *,
+    private_area: Optional[PrivateParkingArea],
+    surface: Optional[SurfaceClassification] = None,
+    m_per_px: float,
+) -> Optional[ScenarioEstimate]:
+    """Places marquées visibles dans la parcelle stricte.
+
+    Cette heuristique ne cherche pas à reconstruire chaque emplacement : elle vérifie
+    qu'il existe des marquages courts et clairs dans le masque privé, puis estime la
+    capacité par surface avec un ratio de parking marqué.
+    """
+    if private_area is None or private_area.usable_mask is None:
+        return None
+    mask = private_area.usable_mask.astype(bool)
+    usable_m2 = float(private_area.usable_area_m2 or 0.0)
+    if usable_m2 < 120.0 or mask.sum() < 80 or not _HAS_CV2:
+        return None
+
+    rgb = np.asarray(chip.image.convert("RGB"), dtype=np.uint8)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    rgb_i = rgb.astype(np.int16)
+    low_sat = (
+        (np.abs(rgb_i[..., 0] - rgb_i[..., 1]) < 38)
+        & (np.abs(rgb_i[..., 1] - rgb_i[..., 2]) < 38)
+        & (np.abs(rgb_i[..., 0] - rgb_i[..., 2]) < 38)
+    )
+    vals = gray[mask]
+    if vals.size == 0:
+        return None
+    bright_thr = max(135, int(np.percentile(vals, 82)))
+    bright = (gray >= bright_thr) & low_sat & mask
+
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    bright_u8 = cv2.morphologyEx(bright.astype(np.uint8) * 255, cv2.MORPH_CLOSE, k)
+    edges = cv2.Canny(bright_u8, 40, 120)
+    min_len_px = max(4, int(round(1.2 / max(m_per_px, 1e-6))))
+    max_gap_px = max(2, int(round(0.8 / max(m_per_px, 1e-6))))
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180.0,
+        threshold=10,
+        minLineLength=min_len_px,
+        maxLineGap=max_gap_px,
+    )
+    if lines is None:
+        return None
+
+    line_mask = np.zeros(mask.shape, dtype=np.uint8)
+    segs: list[tuple[float, float]] = []
+    for l in lines.reshape(-1, 4):
+        x1, y1, x2, y2 = [int(v) for v in l]
+        mx = int(round((x1 + x2) / 2.0))
+        my = int(round((y1 + y2) / 2.0))
+        if my < 0 or my >= mask.shape[0] or mx < 0 or mx >= mask.shape[1] or not mask[my, mx]:
+            continue
+        length_m = float(np.hypot(x2 - x1, y2 - y1) * m_per_px)
+        if length_m < 1.2 or length_m > 8.5:
+            continue
+        angle = (math.degrees(math.atan2(y2 - y1, x2 - x1)) + 180.0) % 180.0
+        segs.append((length_m, angle))
+        cv2.line(line_mask, (x1, y1), (x2, y2), 255, max(1, int(round(0.35 / max(m_per_px, 1e-6)))))
+    if not segs:
+        return None
+
+    total_len_m = sum(s[0] for s in segs)
+    # Score orientation : des marquages de places produisent plusieurs segments parallèles.
+    bins: dict[int, int] = {}
+    for _length, angle in segs:
+        b = int(round(angle / 15.0) * 15) % 180
+        bins[b] = bins.get(b, 0) + 1
+    dominant_count = max(bins.values()) if bins else 0
+    dominant_ratio = dominant_count / max(len(segs), 1)
+    if len(segs) < 4 or dominant_count < 3 or total_len_m < 10.0:
+        return None
+    if usable_m2 > 1000.0 and dominant_ratio < 0.25:
+        return None
+
+    # Pour les grandes parcelles, ne pas projeter les marquages sur toute la surface
+    # privée exploitable : une parcelle peut contenir parking marqué + friche/gravier.
+    # On estime donc sur la zone connectée autour des marquages visibles.
+    zone_mask = line_mask.astype(bool)
+    radius_px = max(4, int(round(9.0 / max(m_per_px, 1e-6))))
+    k_zone = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius_px * 2 + 1, radius_px * 2 + 1))
+    zone_mask = cv2.dilate(zone_mask.astype(np.uint8), k_zone, iterations=1).astype(bool) & mask
+    if surface is not None and surface.parking_eligible_mask.shape == mask.shape:
+        candidate = surface.parking_eligible_mask.astype(bool) & mask
+        if float(candidate.sum()) * (m_per_px ** 2) >= 80.0:
+            zone_mask &= candidate
+    if zone_mask.any():
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(zone_mask.astype(np.uint8), 8)
+        if n > 1:
+            line_labels = labels[line_mask.astype(bool)]
+            line_labels = line_labels[line_labels > 0]
+            if line_labels.size:
+                vals, counts = np.unique(line_labels, return_counts=True)
+                keep = int(vals[int(np.argmax(counts))])
+                zone_mask = labels == keep
+            else:
+                keep = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                zone_mask = labels == keep
+    marked_zone_m2 = float(zone_mask.sum()) * (m_per_px ** 2)
+    estimate_area_m2 = usable_m2
+    if marked_zone_m2 >= 120.0:
+        estimate_area_m2 = min(usable_m2, marked_zone_m2)
+
+    # Parking marqué privé : ratio prudent, incluant circulation interne.
+    if estimate_area_m2 < usable_m2 * 0.85:
+        cap_min = max(1, int(round(estimate_area_m2 / 38.0)))
+        cap_max = max(cap_min, int(round(estimate_area_m2 / 26.0)) + 1)
+        cap_est = max(cap_min, min(cap_max, int(round(estimate_area_m2 / 32.0))))
+    else:
+        cap_min = max(1, int(round(usable_m2 / 65.0)))
+        cap_max = max(cap_min, int(round(usable_m2 / 45.0)) + 1)
+        cap_est = int(round((cap_min + cap_max) / 2.0))
+    conf = (
+        "medium"
+        if (
+            (dominant_count >= 5 and dominant_ratio >= 0.25)
+            or (usable_m2 < 900.0 and len(segs) >= 7)
+        )
+        and total_len_m >= 18.0
+        else "weak"
+    )
+    return ScenarioEstimate(
+        mode="marked_slots",
+        capacity_estimate=cap_est,
+        capacity_min=cap_min,
+        capacity_max=cap_max,
+        confidence=conf,
+        notes="private_marked_slots",
+        extras={
+            "private_marked_slots": True,
+            "private_usable_area_m2": round(usable_m2, 1),
+            "marking_segments": len(segs),
+            "dominant_marking_segments": dominant_count,
+            "dominant_marking_ratio": round(dominant_ratio, 3),
+            "marking_total_length_m": round(total_len_m, 1),
+            "marked_zone_area_m2": round(marked_zone_m2, 1),
+            "estimate_area_m2": round(estimate_area_m2, 1),
+            "m2_per_space_range": [45.0, 65.0],
+        },
+    )
 
 
 # -----------------------------
@@ -240,9 +404,14 @@ def _scenario_unmarked_surface(
     *,
     m_per_px: float,
     site_type: str = "unknown",
+    private_candidate_mask: Optional[np.ndarray] = None,
 ) -> Optional[ScenarioEstimate]:
     """Zone bitumée compacte non marquée : capacité théorique par surface utile (hors circulation)."""
-    eligible = surface.parking_eligible_mask
+    eligible = (
+        private_candidate_mask.astype(bool)
+        if private_candidate_mask is not None and private_candidate_mask.shape == surface.parking_eligible_mask.shape
+        else surface.parking_eligible_mask
+    )
     largest_m2, total_m2, _ = _largest_connected_area_m2(eligible, m_per_px)
     if largest_m2 < 60.0:
         return None
@@ -253,8 +422,15 @@ def _scenario_unmarked_surface(
     circulation_factor = 0.86
     largest_net_m2 = largest_m2 * circulation_factor
 
-    # Facteur d'utilisation : plus la zone est compacte, plus on garde de surface.
-    if largest_m2 < 400.0:
+    private_mask_used = private_candidate_mask is not None
+
+    # Facteur d'utilisation : une cour privée non marquée exige davantage d'espace de manoeuvre
+    # qu'un parking tracé. L'adjacence route peut être nulle après exclusion de la route GIS ;
+    # ce n'est pas bloquant si le masque vient de la parcelle cadastrale stricte.
+    if private_mask_used and 250.0 <= largest_m2 < 2500.0:
+        u_lo, u_hi = 0.25, 0.40
+        confidence = "medium"
+    elif largest_m2 < 400.0:
         u_lo, u_hi = SMALL_LOT_USABLE_LO, SMALL_LOT_USABLE_HI
         confidence = "medium" if adj > 0.15 else "weak"
     elif largest_m2 < 2500.0:
@@ -282,6 +458,7 @@ def _scenario_unmarked_surface(
         extras={
             "unmarked_area_m2": round(largest_m2, 1),
             "total_eligible_area_m2": round(total_m2, 1),
+            "private_candidate_mask_used": private_mask_used,
             "usable_area_factor_lo": u_lo,
             "usable_area_factor_hi": u_hi,
             "adjacency_to_road": round(adj, 3),
@@ -362,11 +539,16 @@ def _scenario_courtyard_parking(
     *,
     m_per_px: float,
     site_type: str = "unknown",
+    private_candidate_mask: Optional[np.ndarray] = None,
 ) -> Optional[ScenarioEstimate]:
     """Cour / garage / zone privée : surface bitumée adjacente à un bâtiment (ratios selon ``site_type``)."""
     if surface.roof_mask.sum() < 50:
         return None
-    eligible = surface.parking_eligible_mask
+    eligible = (
+        private_candidate_mask.astype(bool)
+        if private_candidate_mask is not None and private_candidate_mask.shape == surface.parking_eligible_mask.shape
+        else surface.parking_eligible_mask
+    )
     if not _HAS_CV2 or eligible.sum() < 50:
         return None
     # Dilate les toits et garde l'intersection avec eligible : zone bitumée touchant un bâtiment.
@@ -397,6 +579,7 @@ def _scenario_courtyard_parking(
         notes="cour_industrielle_ou_arriere_batiment",
         extras={
             "courtyard_area_m2": round(area_m2, 1),
+            "private_candidate_mask_used": private_candidate_mask is not None,
             "usable_area_factor_lo": u_lo,
             "usable_area_factor_hi": u_hi,
             "adjacency_to_road": round(adj, 3),
@@ -440,11 +623,21 @@ def analyze_parking_scenarios(
     *,
     segformer_parking_mask: Optional[np.ndarray] = None,
     yolo_vehicle_weights=None,
+    auto_download_yolo: bool = False,
+    auto_download_aerial_yolo: bool = False,
+    use_finetuned_french: bool = False,
+    use_dota_finetuned: bool = False,
+    aerial_weights_cache_dir=None,
+    parcelle_polygon_lonlat=None,
+    vehicle_clip_polygon_lonlat=None,
     has_osm_capacity: bool = False,
     bdtopo_buildings_mask: Optional[np.ndarray] = None,
     gis_augmentation: Optional[GisFusionResult] = None,
     max_plausible_slots_cap: int = 39,
     site_type: str = "unknown",
+    yolo_slot_weights=None,
+    roboflow_api_key: Optional[str] = None,
+    roboflow_model_id: Optional[str] = None,
 ) -> MultiScenarioResult:
     """``parking_capacity_estimation`` : surface → scénarios théoriques → preuves véhicules (secondaires) → sémantique.
 
@@ -489,12 +682,51 @@ def analyze_parking_scenarios(
             chip, surface.parking_eligible_mask, surface.road_mask, fusion,
         )
 
-    marked, geo = _scenario_marked_slots(
-        chip, surface, segformer_mask=segformer_parking_mask, m_per_px=m_per_px,
+    private_area = compute_private_parking_area(
+        chip,
+        surface,
+        parcel_polygon_lonlat=parcelle_polygon_lonlat,
+        fusion=fusion,
     )
-    unmarked = _scenario_unmarked_surface(chip, surface, m_per_px=m_per_px, site_type=site_type)
+    parcelle_polygon_px = lonlat_polyline_to_pixels(parcelle_polygon_lonlat, chip) if parcelle_polygon_lonlat is not None else None
+    vehicle_clip_polygon_px = (
+        lonlat_polyline_to_pixels(vehicle_clip_polygon_lonlat, chip)
+        if vehicle_clip_polygon_lonlat is not None
+        else parcelle_polygon_px
+    )
+    private_mask = private_area.usable_mask
+
+    marked, geo = _scenario_marked_slots(
+        chip,
+        surface,
+        segformer_mask=segformer_parking_mask,
+        m_per_px=m_per_px,
+        private_candidate_mask=private_mask,
+    )
+    private_marked = _scenario_private_marked_slots(
+        chip,
+        private_area=private_area,
+        surface=surface,
+        m_per_px=m_per_px,
+    )
+    if private_marked is not None:
+        if marked is None or _CONF_RANK.get(private_marked.confidence, 0) >= _CONF_RANK.get(marked.confidence, 0):
+            marked = private_marked
+    unmarked = _scenario_unmarked_surface(
+        chip,
+        surface,
+        m_per_px=m_per_px,
+        site_type=site_type,
+        private_candidate_mask=private_mask,
+    )
     roadside = _scenario_roadside_parking(chip, surface, m_per_px=m_per_px)
-    courtyard = _scenario_courtyard_parking(chip, surface, m_per_px=m_per_px, site_type=site_type)
+    courtyard = _scenario_courtyard_parking(
+        chip,
+        surface,
+        m_per_px=m_per_px,
+        site_type=site_type,
+        private_candidate_mask=private_mask,
+    )
 
     components: Dict[str, Optional[ScenarioEstimate]] = {
         "marked_slots": marked,
@@ -515,6 +747,12 @@ def analyze_parking_scenarios(
         asphalt_mask=veh_mask,
         m_per_px=m_per_px,
         yolo_weights=yolo_vehicle_weights,
+        auto_download_yolo=auto_download_yolo,
+        auto_download_aerial_yolo=auto_download_aerial_yolo,
+        use_finetuned_french=use_finetuned_french,
+        use_dota_finetuned=use_dota_finetuned,
+        aerial_weights_cache_dir=aerial_weights_cache_dir,
+        parcelle_polygon_px=vehicle_clip_polygon_px,
     )
     geo_rep = geo.repeated_pattern_score if geo else 0.0
     sep_density = 0.0
@@ -568,6 +806,33 @@ def analyze_parking_scenarios(
             f"(surface utile {semantic.parking_outside_buildings_ratio*100:.0f}% hors bâtiments)"
         )
 
+    # --- Phase 3 : détection des places marquées (pleines + vides) ---
+    slot_result = None
+    try:
+        from parking_capacity.parking_slot_detection import detect_slots
+
+        row_lengths = list(geo.row_lengths_m) if geo and getattr(geo, "row_lengths_m", None) else []
+        row_orientation = float(geo.estimated_row_orientation_deg) if geo else 0.0
+        slot_result = detect_slots(
+            chip.image,
+            m_per_px=m_per_px,
+            row_lengths_m=row_lengths,
+            row_orientation_deg=row_orientation,
+            vehicles=vehicles.vehicles if vehicles else None,
+            plausible_ceiling=semantic.plausible_capacity_ceiling,
+            parcelle_polygon_px=vehicle_clip_polygon_px,
+            yolo_weights=yolo_slot_weights,
+            roboflow_api_key=roboflow_api_key,
+            roboflow_model_id=roboflow_model_id,
+        )
+        if slot_result.method != "none":
+            notes.append(
+                f"slots ({slot_result.method}) : total={slot_result.slots_total_count}, "
+                f"pleines={slot_result.slots_filled_count}, vides={slot_result.slots_empty_count}"
+            )
+    except Exception as e:  # noqa: BLE001
+        notes.append(f"slots: erreur détection ({e})")
+
     return MultiScenarioResult(
         primary_mode=primary_mode if primary_est else "unknown",
         primary_estimate=primary_est,
@@ -582,6 +847,8 @@ def analyze_parking_scenarios(
         fusion_usable_parking_area_m2=fusion_usable,
         fusion_final_candidate_area_m2=fusion_final_m2,
         fusion_final_parking_candidate_mask=fusion_final_mask,
+        slots=slot_result,
+        private_parking_area=private_area,
     )
 
 

@@ -1,12 +1,19 @@
 """Détection de véhicules sur orthophoto.
 
-Deux pistes :
-1. **YOLO** si poids fournis (ultralytics, classe ``car``/``vehicle``/``truck``) — détecteur sémantique.
-2. **Fallback OpenCV** : détection de blobs rectangulaires sur asphalte, filtrés par taille
-   (2–3 m × 4–5 m → ~8–15 m² au sol) et aspect ratio (1.4–3.0).
+Trois pistes (priorité décroissante) :
 
-Les véhicules détectés servent de **preuve d'usage parking** : ils ne donnent pas directement la
-capacité, mais valident qu'une zone bitumée est effectivement utilisée pour stationner.
+1. **YOLO + SAHI** (Slicing Aided Hyper Inference) — détecteur Ultralytics découpé en patchs pour
+   ne pas rater les petits véhicules sur grande orthophoto. Active si ``yolo_weights`` est fourni
+   *ou* si ``auto_download`` est activé (télécharge ``yolov8s.pt`` Ultralytics qui détecte
+   ``car/truck/bus/motorcycle`` en COCO).
+2. **YOLO simple** (sans SAHI) si SAHI indisponible.
+3. **Fallback OpenCV** : blobs rectangulaires contrastés sur asphalte (heuristique, peu fiable).
+
+Pour des résultats vraiment robustes sur orthophoto BD ORTHO (0.1-0.3 m/px), on recommande de
+fine-tuner sur **CARPK** ou **DOTA-v2** — voir ``docs/aerial_vehicle_detection.md``.
+
+Les véhicules détectés alimentent la couche sémantique (preuve d'usage parking, score d'alignement)
+mais ne pilotent pas la capacité principale.
 """
 
 from __future__ import annotations
@@ -176,25 +183,182 @@ def _detect_vehicles_opencv(
 
 
 # -----------------------------
-# YOLO (optionnel)
+# YOLO + SAHI (optionnel)
 # -----------------------------
 
-def _detect_vehicles_yolo(image: Image.Image, weights: Path) -> List[Vehicle]:
-    """YOLO ultralytics ; les classes COCO ``car``/``truck``/``bus``/``motorcycle`` deviennent véhicule."""
+VEHICLE_COCO_CLASSES = {"car", "truck", "bus", "motorcycle", "vehicle"}
+# Classes VisDrone (drone aérien) : modèle mshamrai/yolov8s-visdrone
+# 0:pedestrian 1:people 2:bicycle 3:car 4:van 5:truck 6:tricycle 7:awning-tricycle 8:bus 9:motor
+VEHICLE_VISDRONE_CLASSES = {"car", "van", "truck", "bus", "motor"}
+ALL_VEHICLE_CLASSES = VEHICLE_COCO_CLASSES | VEHICLE_VISDRONE_CLASSES
+
+DEFAULT_YOLO_MODEL = "yolov8s.pt"  # Ultralytics COCO (faible sur aérien)
+DEFAULT_AERIAL_HF_REPO = "mshamrai/yolov8s-visdrone"  # VisDrone (drone aérien, vraies voitures)
+DEFAULT_AERIAL_HF_FILENAME = "best.pt"
+
+# Chemin local d'un éventuel modèle fine-tuné sur chips BD ORTHO françaises
+# (self-pseudo-labeling, voir scripts/finetune_aerial_yolo.py).
+FINETUNED_FRENCH_WEIGHTS = Path(
+    "/Users/mac/Yolo/data/aerial_weights/finetuned_v1/run1/weights/best.pt"
+)
+
+# Fine-tuning sur DOTAv1 vehicles (51 700 véhicules réels annotés humainement, Wuhan University).
+# On essaie run2 (paramètres optimisés MPS), puis run1 (legacy).
+DOTA_FINETUNED_WEIGHTS_CANDIDATES = [
+    Path("/Users/mac/Yolo/data/aerial_weights/dota_finetune_v1/run2/weights/best.pt"),
+    Path("/Users/mac/Yolo/data/aerial_weights/dota_finetune_v1/run1/weights/best.pt"),
+]
+DOTA_FINETUNED_WEIGHTS = DOTA_FINETUNED_WEIGHTS_CANDIDATES[0]  # alias historique
+
+
+def _resolve_finetuned_french_weights() -> Optional[str]:
+    """Retourne le chemin du modèle fine-tuné français si présent, sinon None."""
+    if FINETUNED_FRENCH_WEIGHTS.is_file():
+        return str(FINETUNED_FRENCH_WEIGHTS)
+    return None
+
+
+def _resolve_dota_finetuned_weights() -> Optional[str]:
+    """Retourne le chemin du modèle fine-tuné DOTA si présent (run2 puis run1)."""
+    for candidate in DOTA_FINETUNED_WEIGHTS_CANDIDATES:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _resolve_yolo_weights(weights: Optional[Path], auto_download: bool) -> Optional[str]:
+    """Retourne le chemin (ou nom de modèle Ultralytics) ou None si rien d'utilisable."""
+    if weights is not None and Path(weights).is_file():
+        return str(weights)
+    if auto_download:
+        # Ultralytics télécharge le poids automatiquement à la première utilisation.
+        return DEFAULT_YOLO_MODEL
+    return None
+
+
+def _find_local_default_yolo_weights() -> Optional[str]:
+    """Cherche ``yolov8s.pt`` dans le CWD ou à la racine du dépôt.
+
+    Permet d'utiliser YOLO sans drapeau explicite quand le poids est posé à côté du projet
+    (le cas par défaut après ``ultralytics`` qui télécharge dans le CWD).
+    """
+    candidates = [Path.cwd() / DEFAULT_YOLO_MODEL]
+    try:
+        candidates.append(Path(__file__).resolve().parents[2] / DEFAULT_YOLO_MODEL)
+    except IndexError:
+        pass
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    return None
+
+
+def _resolve_aerial_yolo_weights(cache_dir: Optional[Path] = None) -> Optional[str]:
+    """Télécharge (et cache) le YOLO aérien VisDrone depuis HuggingFace Hub.
+
+    Retourne le chemin local du fichier ``best.pt`` ou ``None`` si impossible.
+    Le modèle VisDrone donne des détections beaucoup plus fiables sur orthophoto BD ORTHO
+    que ``yolov8s.pt`` COCO (entraîné sur photos sol).
+    """
+    try:
+        from huggingface_hub import hf_hub_download  # type: ignore
+    except ImportError:
+        return None
+    cache = str(cache_dir) if cache_dir else None
+    try:
+        return hf_hub_download(
+            repo_id=DEFAULT_AERIAL_HF_REPO,
+            filename=DEFAULT_AERIAL_HF_FILENAME,
+            cache_dir=cache,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _detect_vehicles_yolo_sahi(
+    image: Image.Image,
+    model_path: str,
+    *,
+    slice_height: int = 512,
+    slice_width: int = 512,
+    overlap_ratio: float = 0.20,
+    conf_th: float = 0.25,
+) -> Tuple[List[Vehicle], str]:
+    """SAHI sliced inference avec un modèle Ultralytics. Retourne (vehicles, method)."""
+    try:
+        from sahi import AutoDetectionModel  # type: ignore
+        from sahi.predict import get_sliced_prediction  # type: ignore
+    except ImportError:
+        return [], "yolo_no_sahi"
+
+    try:
+        det_model = AutoDetectionModel.from_pretrained(
+            model_type="ultralytics",
+            model_path=model_path,
+            confidence_threshold=conf_th,
+            device="cpu",
+        )
+    except Exception:  # noqa: BLE001
+        try:
+            det_model = AutoDetectionModel.from_pretrained(
+                model_type="yolov8",
+                model_path=model_path,
+                confidence_threshold=conf_th,
+                device="cpu",
+            )
+        except Exception:  # noqa: BLE001
+            return [], "yolo_load_failed"
+
+    try:
+        arr = np.asarray(image.convert("RGB"))
+        result = get_sliced_prediction(
+            arr,
+            det_model,
+            slice_height=int(slice_height),
+            slice_width=int(slice_width),
+            overlap_height_ratio=float(overlap_ratio),
+            overlap_width_ratio=float(overlap_ratio),
+            verbose=0,
+        )
+    except Exception:  # noqa: BLE001
+        return [], "yolo_inference_failed"
+
+    out: List[Vehicle] = []
+    for op in result.object_prediction_list:
+        try:
+            name = (op.category.name or "").lower()
+        except AttributeError:
+            name = ""
+        if name and name not in ALL_VEHICLE_CLASSES:
+            continue
+        try:
+            box = op.bbox.to_xyxy()
+            x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+            conf = float(op.score.value)
+        except Exception:  # noqa: BLE001
+            continue
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        w = max(abs(x2 - x1), 1.0)
+        h = max(abs(y2 - y1), 1.0)
+        angle = 0.0 if w >= h else 90.0
+        out.append(Vehicle(cx=cx, cy=cy, width_px=w, height_px=h, angle_deg=angle, area_px=w * h, confidence=conf))
+    return out, "yolo_sahi"
+
+
+def _detect_vehicles_yolo_direct(image: Image.Image, model_path: str, conf_th: float = 0.20) -> List[Vehicle]:
+    """Inférence Ultralytics directe sans SAHI (fallback)."""
     try:
         from ultralytics import YOLO  # type: ignore
     except ImportError:
         return []
-    if not weights.is_file():
-        return []
     try:
-        model = YOLO(str(weights))
+        model = YOLO(model_path)
         arr = np.asarray(image.convert("RGB"))
-        results = model.predict(arr, conf=0.20, verbose=False)
+        results = model.predict(arr, conf=conf_th, verbose=False)
     except Exception:  # noqa: BLE001
         return []
 
-    vehicle_classes = {"car", "truck", "bus", "motorcycle", "vehicle"}
     out: List[Vehicle] = []
     for r in results:
         names = r.names if hasattr(r, "names") else {}
@@ -204,7 +368,7 @@ def _detect_vehicles_yolo(image: Image.Image, weights: Path) -> List[Vehicle]:
             try:
                 cls_id = int(b.cls.cpu().numpy().flatten()[0])
                 name = str(names.get(cls_id, "")).lower()
-                if name and name not in vehicle_classes:
+                if name and name not in ALL_VEHICLE_CLASSES:
                     continue
                 xyxy = b.xyxy.cpu().numpy().flatten().tolist()
                 conf = float(b.conf.cpu().numpy().flatten()[0])
@@ -217,11 +381,44 @@ def _detect_vehicles_yolo(image: Image.Image, weights: Path) -> List[Vehicle]:
             cy = 0.5 * (y1 + y2)
             w = max(abs(x2 - x1), 1.0)
             h = max(abs(y2 - y1), 1.0)
-            longe = max(w, h)
-            shorte = min(w, h)
             angle = 0.0 if w >= h else 90.0
-            area = w * h
-            out.append(Vehicle(cx, cy, w, h, angle, area, conf))
+            out.append(Vehicle(cx, cy, w, h, angle, w * h, conf))
+    return out
+
+
+def _filter_by_size_m(vehicles: List[Vehicle], m_per_px: float, *, allow_large: bool = True) -> List[Vehicle]:
+    """Garde uniquement les détections dont la bbox correspond à un véhicule plausible (m²).
+
+    ``allow_large`` : si True, accepte aussi camions/utilitaires (jusqu'à 50 m²) — utile pour
+    modèle VisDrone qui détecte trucks/vans/bus.
+    """
+    out: List[Vehicle] = []
+    max_longe = VEHICLE_LENGTH_MAX_M * (2.5 if allow_large else 1.5)
+    max_shorte = VEHICLE_WIDTH_MAX_M * (2.5 if allow_large else 1.5)
+    max_area = 50.0 if allow_large else 35.0
+    for v in vehicles:
+        longe = max(v.width_px, v.height_px) * m_per_px
+        shorte = min(v.width_px, v.height_px) * m_per_px
+        area_m2 = v.area_px * (m_per_px ** 2)
+        if longe < VEHICLE_LENGTH_MIN_M * 0.6 or longe > max_longe:
+            continue
+        if shorte < VEHICLE_WIDTH_MIN_M * 0.6 or shorte > max_shorte:
+            continue
+        if area_m2 < 2.0 or area_m2 > max_area:
+            continue
+        out.append(v)
+    return out
+
+
+def _clip_to_polygon_pixels(vehicles: List[Vehicle], polygon_px: np.ndarray) -> List[Vehicle]:
+    """Filtre les véhicules dont le centre est à l'intérieur du polygone (pixels)."""
+    if polygon_px is None or polygon_px.shape[0] < 3 or not _HAS_CV2:
+        return vehicles
+    poly = polygon_px.astype(np.int32)
+    out: List[Vehicle] = []
+    for v in vehicles:
+        if cv2.pointPolygonTest(poly, (float(v.cx), float(v.cy)), False) >= 0:
+            out.append(v)
     return out
 
 
@@ -296,21 +493,122 @@ def detect_vehicles(
     asphalt_mask: Optional[np.ndarray],
     m_per_px: float,
     yolo_weights: Optional[Path] = None,
+    auto_download_yolo: bool = False,
+    auto_download_aerial_yolo: bool = False,
+    use_finetuned_french: bool = False,
+    use_dota_finetuned: bool = False,
+    aerial_weights_cache_dir: Optional[Path] = None,
+    sahi_slice_px: int = 512,
+    sahi_overlap: float = 0.20,
+    conf_threshold: Optional[float] = None,
+    parcelle_polygon_px: Optional[np.ndarray] = None,
 ) -> VehicleDetectionResult:
-    """Pipeline complet : YOLO si poids dispo, sinon OpenCV ; clusters + scores."""
+    """Pipeline complet : YOLO+SAHI → YOLO direct → OpenCV ; filtre par taille m² + polygone parcelle.
+
+    ``parcelle_polygon_px`` : polygone N×2 (pixels relatifs à l'image), pour ne compter que les
+    véhicules à l'intérieur de la parcelle cadastrale (recommandé fortement).
+    """
     vehicles: List[Vehicle] = []
     method = "none"
+    is_aerial = False
 
-    if yolo_weights is not None:
-        vehicles = _detect_vehicles_yolo(image, yolo_weights)
-        if vehicles:
-            method = "yolo"
+    # Priorité : poids fournis > DOTA fine-tuned > french fine-tuned > VisDrone HF Hub > COCO
+    model_path: Optional[str] = None
+    used_finetuned = False
+    used_dota = False
+    if yolo_weights is not None and Path(yolo_weights).is_file():
+        model_path = str(yolo_weights)
+        is_aerial = True
+    elif use_dota_finetuned:
+        dt = _resolve_dota_finetuned_weights()
+        if dt is not None:
+            model_path = dt
+            is_aerial = True
+            used_dota = True
+        else:
+            # Fallback VisDrone si DOTA pas dispo
+            model_path = _resolve_aerial_yolo_weights(cache_dir=aerial_weights_cache_dir)
+            is_aerial = model_path is not None
+    elif use_finetuned_french:
+        ft = _resolve_finetuned_french_weights()
+        if ft is not None:
+            model_path = ft
+            is_aerial = True
+            used_finetuned = True
+        else:
+            model_path = _resolve_aerial_yolo_weights(cache_dir=aerial_weights_cache_dir)
+            is_aerial = model_path is not None
+    elif auto_download_aerial_yolo:
+        model_path = _resolve_aerial_yolo_weights(cache_dir=aerial_weights_cache_dir)
+        is_aerial = model_path is not None
+    elif auto_download_yolo:
+        model_path = DEFAULT_YOLO_MODEL
+        is_aerial = False
+
+    # Dernier recours : poids local yolov8s.pt présent dans le CWD ou la racine du dépôt.
+    # Évite que la détection retombe en silence sur ``opencv_fallback`` quand le poids
+    # est disponible mais qu'aucun drapeau d'activation n'a été passé.
+    if model_path is None:
+        local = _find_local_default_yolo_weights()
+        if local is not None:
+            model_path = local
+            is_aerial = False
+
+    # Seuil par défaut : 0.10 aérien (modèle spécialisé), 0.07 COCO (récupère les faibles).
+    # Le modèle COCO yolov8s.pt résolu via auto-download OU via découverte locale partage
+    # le même seuil bas — un seuil 0.20 trop strict masquait les véhicules en orthophoto.
+    if conf_threshold is None:
+        if is_aerial:
+            conf_threshold = 0.10
+        elif model_path is not None and not is_aerial:
+            conf_threshold = 0.07
+        else:
+            conf_threshold = 0.20
+
+    if model_path is not None:
+        sahi_vehs, sahi_method = _detect_vehicles_yolo_sahi(
+            image,
+            model_path,
+            slice_height=sahi_slice_px,
+            slice_width=sahi_slice_px,
+            overlap_ratio=sahi_overlap,
+            conf_th=conf_threshold,
+        )
+        if sahi_vehs:
+            vehicles = sahi_vehs
+            if used_dota:
+                method = "yolo_dota_finetuned_sahi"
+            elif used_finetuned:
+                method = "yolo_finetuned_french_sahi"
+            else:
+                method = "yolo_visdrone_sahi" if is_aerial else sahi_method
+        elif sahi_method in ("yolo_no_sahi", "yolo_load_failed"):
+            direct = _detect_vehicles_yolo_direct(image, model_path, conf_th=conf_threshold)
+            if direct:
+                vehicles = direct
+                if used_dota:
+                    method = "yolo_dota_finetuned_direct"
+                elif used_finetuned:
+                    method = "yolo_finetuned_french_direct"
+                else:
+                    method = "yolo_visdrone_direct" if is_aerial else "yolo_direct"
 
     if not vehicles and asphalt_mask is not None and asphalt_mask.sum() > 0:
         rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
         vehicles = _detect_vehicles_opencv(rgb, asphalt_mask.astype(np.bool_), m_per_px=m_per_px)
         if vehicles:
             method = "opencv_fallback"
+
+    # Filtre par taille au sol plausible (élimine les faux positifs YOLO)
+    if vehicles:
+        vehicles = _filter_by_size_m(vehicles, m_per_px)
+
+    # Filtre par polygone parcelle (gros gain : exclut voirie + parkings voisins)
+    if vehicles and parcelle_polygon_px is not None:
+        before = len(vehicles)
+        vehicles = _clip_to_polygon_pixels(vehicles, parcelle_polygon_px)
+        if before > 0 and not vehicles:
+            method = f"{method}_no_in_polygon"
 
     clusters = _cluster_aligned(vehicles, m_per_px) if vehicles else []
 

@@ -615,6 +615,49 @@ def diagnose_address_cmd(
         "--providers-yaml",
         help="Fichier providers.yaml (GIS : IGN WFS, Overpass transport, …)",
     ),
+    vehicle_yolo_weights: Optional[Path] = typer.Option(
+        None,
+        "--vehicle-yolo-weights",
+        exists=True, readable=True,
+        help="Poids YOLOv8 véhicules aériens (CARPK/DOTA fine-tuné).",
+    ),
+    auto_yolo: bool = typer.Option(
+        False,
+        "--auto-yolo",
+        help="Télécharge automatiquement yolov8s.pt (COCO) pour détecter véhicules via SAHI.",
+    ),
+    aerial_yolo: bool = typer.Option(
+        False,
+        "--aerial-yolo",
+        help="Télécharge automatiquement YOLOv8 VisDrone (mshamrai/yolov8s-visdrone) "
+             "depuis HuggingFace Hub — modèle aérien spécialisé, recommandé sur orthophoto.",
+    ),
+    finetuned_yolo: bool = typer.Option(
+        False,
+        "--finetuned-yolo",
+        help="Utilise le modèle YOLO fine-tuné sur chips BD ORTHO françaises "
+             "(self-pseudo-labeling). Fallback sur VisDrone si fichier absent.",
+    ),
+    dota_yolo: bool = typer.Option(
+        False,
+        "--dota-yolo",
+        help="Utilise le modèle YOLO fine-tuné sur DOTAv1 vehicles "
+             "(51k bboxes humaines, Wuhan University). Fallback VisDrone si absent.",
+    ),
+    slot_yolo_weights: Optional[Path] = typer.Option(
+        None,
+        "--slot-yolo-weights",
+        exists=True, readable=True,
+        help="Poids YOLO places de parking (fine-tuné aérien parking_space_empty/filled).",
+    ),
+    roboflow_api_key: Optional[str] = typer.Option(
+        None, "--roboflow-api-key",
+        help="Clé API Roboflow Universe pour modèle slot detection hébergé.",
+    ),
+    roboflow_model_id: Optional[str] = typer.Option(
+        None, "--roboflow-model-id",
+        help="Identifiant modèle Roboflow (ex. 'workspace/project/3').",
+    ),
 ) -> None:
     """Exporte orthophoto + JSON + carte de debug pour vérifier visuellement l'analyse."""
     from parking_capacity.diagnose import run_diagnose_address
@@ -638,6 +681,14 @@ def diagnose_address_cmd(
         visual_model_specialized_for_parking=visual_model_specialized,
         yolo_weights=yolo_weights,
         providers_yaml=providers_yaml,
+        vehicle_yolo_weights=vehicle_yolo_weights,
+        auto_download_vehicle_yolo=auto_yolo,
+        auto_download_aerial_yolo=aerial_yolo,
+        use_finetuned_french_yolo=finetuned_yolo,
+        use_dota_finetuned_yolo=dota_yolo,
+        slot_yolo_weights=slot_yolo_weights,
+        roboflow_api_key=roboflow_api_key,
+        roboflow_model_id=roboflow_model_id,
     )
     typer.echo(f"Artefacts : {out.resolve()}")
 
@@ -1398,6 +1449,117 @@ def import_colab_model_cmd(
 
     r = run_import_colab_model(zip_path, out)
     typer.echo(json.dumps(r, indent=2, default=str))
+
+
+@app.command("validate-benchmark")
+def validate_benchmark_cmd(
+    input_csv: Path = typer.Option(
+        ...,
+        "--input", "-i",
+        exists=True, readable=True,
+        help="CSV avec colonnes au minimum 'address' et 'human_count' "
+             "(estimated_capacity sera ajoutée si absente).",
+    ),
+    out: Path = typer.Option(..., "--out", "-o", help="Répertoire de sortie."),
+    skip_inference: bool = typer.Option(
+        False, "--skip-inference",
+        help="Si la colonne estimated_capacity est déjà présente, ne pas relancer le pipeline.",
+    ),
+    cache_dir: Optional[Path] = typer.Option(None, "--cache-dir"),
+    overpass_delay: float = typer.Option(1.0, "--overpass-delay"),
+    source_priority: str = typer.Option("hybrid", "--source-priority"),
+    radius_m: int = typer.Option(80, "--radius-m"),
+    chip_half_side_m: float = typer.Option(80.0, "--chip-half-side-m"),
+    visual_backend: str = typer.Option("auto", "--visual-backend"),
+    providers_yaml: Optional[Path] = typer.Option(None, "--providers-yaml"),
+    auto_yolo: bool = typer.Option(False, "--auto-yolo"),
+    aerial_yolo: bool = typer.Option(False, "--aerial-yolo", help="VisDrone aérien via HF Hub."),
+    dota_yolo: bool = typer.Option(False, "--dota-yolo", help="YOLO fine-tuné sur DOTAv1 vehicles."),
+    vehicle_yolo_weights: Optional[Path] = typer.Option(None, "--vehicle-yolo-weights", exists=True, readable=True),
+    slot_yolo_weights: Optional[Path] = typer.Option(None, "--slot-yolo-weights", exists=True, readable=True),
+    roboflow_api_key: Optional[str] = typer.Option(None, "--roboflow-api-key"),
+    roboflow_model_id: Optional[str] = typer.Option(None, "--roboflow-model-id"),
+) -> None:
+    """Validation terrain avec MAE/MAPE/R²/bootstrap CI + segmentation par typologie.
+
+    Format CSV : address, human_count (obligatoires) ; site_type, notes (optionnels).
+    """
+    import pandas as pd
+
+    from parking_capacity.benchmark_validation import write_validation_report
+    from parking_capacity.pipeline import process_address, row_to_json_serializable
+
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    df = pd.read_csv(input_csv)
+    if "address" not in df.columns:
+        for c in ("Adresse", "adresse", "Address"):
+            if c in df.columns:
+                df = df.rename(columns={c: "address"})
+                break
+    if "human_count" not in df.columns:
+        raise typer.BadParameter("CSV doit contenir une colonne 'human_count'.")
+
+    if not skip_inference:
+        rows_out = []
+        for idx, row in df.iterrows():
+            addr = str(row.get("address", "")).strip()
+            if not addr:
+                continue
+            try:
+                r = process_address(
+                    addr,
+                    search_radius_m=radius_m,
+                    chip_half_side_m=chip_half_side_m,
+                    use_vision=True,
+                    cache_dir=cache_dir,
+                    source_priority=source_priority,
+                    visual_backend=visual_backend,
+                    providers_yaml=providers_yaml,
+                    overpass_delay_s=overpass_delay,
+                    auto_download_vehicle_yolo=auto_yolo,
+                    auto_download_aerial_yolo=aerial_yolo,
+                    use_dota_finetuned_yolo=dota_yolo,
+                    vehicle_yolo_weights=vehicle_yolo_weights,
+                    slot_yolo_weights=slot_yolo_weights,
+                    roboflow_api_key=roboflow_api_key,
+                    roboflow_model_id=roboflow_model_id,
+                )
+                d = row_to_json_serializable(r)
+            except Exception as e:  # noqa: BLE001
+                d = {"address": addr, "error": str(e)}
+            d["human_count"] = row.get("human_count")
+            if "site_type" in row and not pd.isna(row["site_type"]):
+                d["site_type"] = row["site_type"]
+            rows_out.append(d)
+            typer.echo(f"[{idx+1}/{len(df)}] {addr} → "
+                       f"est={d.get('estimated_capacity')}, hum={d.get('human_count')}")
+        df = pd.DataFrame(rows_out)
+        df.to_csv(out / "predictions.csv", index=False)
+
+    md = write_validation_report(df, out)
+    typer.echo(f"Rapport : {md}")
+
+
+@app.command("evaluate-front-validations")
+def evaluate_front_validations_cmd(
+    input_csv: Path = typer.Option(
+        Path("data/benchmark/manual_front_validations.csv"),
+        "--input", "-i",
+        exists=True, readable=True,
+        help="CSV produit par le panneau de validation de l'UI.",
+    ),
+    out: Path = typer.Option(
+        Path("data/benchmark/manual_front_validation_report"),
+        "--out", "-o",
+        help="Répertoire de sortie du rapport.",
+    ),
+) -> None:
+    """Évalue les annotations enregistrées depuis le front sans relancer le modèle."""
+    from parking_capacity.benchmark_validation import write_front_validation_report
+
+    md = write_front_validation_report(input_csv, out)
+    typer.echo(f"Rapport : {md}")
 
 
 def main() -> None:

@@ -123,6 +123,22 @@ def test_ceiling_caps_implausible_capacity():
         assert r.semantic.plausible_capacity_ceiling <= 80
 
 
+def test_ceiling_scales_with_large_surface():
+    """Grande surface utilisable → plafond doit dépasser le cap dur de 39 places.
+
+    Régression : un cap dur à 39 sur tous les sites écrasait les estimations légitimes
+    de grandes parcelles (>2000 m² de bitume utile) à 39 places maximum.
+    """
+    pytest.importorskip("cv2")
+    arr = _gray(512, 512, level=120)
+    chip = _chip(arr, side_m=80.0)  # 6400 m² total — chip large couvert d'asphalte
+    r = analyze_parking_scenarios(chip)
+    assert r.semantic is not None
+    if r.semantic.plausible_capacity_ceiling is not None:
+        # Plafond surface/25 m²/place ≈ 256 places → cap doit largement dépasser 39
+        assert r.semantic.plausible_capacity_ceiling > 39
+
+
 def test_neufchatel_synthetic_converges_or_refuses():
     """Petit parking façade + toits adjacents → soit ≤ 40 places, soit confiance non strong."""
     pytest.importorskip("cv2")
