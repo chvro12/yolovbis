@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -281,9 +282,15 @@ def harvest_real_dataset_cmd(
     typer.echo(f"Manifest : {path}")
 
 
+def _default_ui_host() -> str:
+    if os.environ.get("CODESPACES") or os.environ.get("CODESPACE_NAME"):
+        return "0.0.0.0"
+    return "127.0.0.1"
+
+
 @app.command("ui")
 def ui_command(
-    host: str = typer.Option("127.0.0.1", "--host", help="Adresse d’écoute"),
+    host: str = typer.Option(_default_ui_host(), "--host", help="Adresse d’écoute"),
     port: int = typer.Option(7860, "--port", help="Port HTTP"),
     share: bool = typer.Option(
         False,

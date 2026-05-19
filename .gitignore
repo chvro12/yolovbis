@@ -8,13 +8,31 @@ __pycache__/
 dist/
 build/
 out/
-data/
 datasets/
 .harvest_tmp/
 
-# Poids YOLO (télécharger localement ou via Colab)
-*.pt
+# Poids à la racine (téléchargés par setup_codespace.sh)
+/*.pt
+
+# Données locales : tout data/ sauf checkpoints et échantillons listés ci-dessous
+data/**
+!data/aerial_weights/
+data/aerial_weights/**
+!data/aerial_weights/dota_finetune_v1/
+data/aerial_weights/dota_finetune_v1/**
+!data/aerial_weights/dota_finetune_v1/run2/
+data/aerial_weights/dota_finetune_v1/run2/**
+!data/aerial_weights/dota_finetune_v1/run2/weights/
+data/aerial_weights/dota_finetune_v1/run2/weights/**
+!data/aerial_weights/dota_finetune_v1/run2/weights/best.pt
+!data/runs/
+data/runs/**
+!data/runs/essai_cli_train/
+data/runs/essai_cli_train/**
+!data/runs/essai_cli_train/best.pt
+!data/benchmark/
+data/benchmark/**
+!data/benchmark/addresses.csv
 
 # Secrets locaux (Mapillary, ArcGIS, etc.)
 .env
-

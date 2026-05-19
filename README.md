@@ -8,13 +8,25 @@ Outil en ligne de commande (France) : à partir d’une **adresse** (CSV), estim
 4. **Orthophoto BD ORTHO** (WMS Géoplateforme [`data.geopf.fr/wms-r`](https://cartes.gouv.fr/aide/fr/guides-utilisateur/utiliser-les-services-de-la-geoplateforme/diffusion/wms-raster/)) : **géométrie parking** (OpenCV : Canny / Hough) en secours structurant ; **SegFormer** [UTEL-UIUC/SegFormer-large-parking](https://huggingface.co/UTEL-UIUC/SegFormer-large-parking) (poids `best_model.ckpt`, prétraitement compatible **nvidia/mit-b5**) n’est qu’**indice faible** sur le nombre de places tant qu’il n’est pas considéré comme modèle orthophoto *spécialisé* (`--visual-model-specialized`).  
 5. **Optionnel** : régression ML sur puces, YOLO parking (`--yolo-weights` + `ultralytics`), backends futurs (`--visual-backend`).
 
+## GitHub Codespaces
+
+Ouvrez le dépôt dans un **Codespace** : le devcontainer installe les dépendances et télécharge les poids Ultralytics / VisDrone. Les checkpoints DOTA et parking-seg sont dans le dépôt (`data/aerial_weights/…`, `data/runs/essai_cli_train/best.pt`).
+
+```bash
+parking-capacity diagnose-address "2 Bd Industriel, 76270 Neufchâtel-en-Bray" --dota-yolo --out /tmp/diag
+parking-capacity ui --port 7860
+```
+
+Détails : [`docs/codespace.md`](docs/codespace.md).
+
 ## Installation
 
 ```bash
 cd /chemin/vers/Yolo
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,ui,train_satellite]"
+bash scripts/setup_codespace.sh   # yolov8s.pt + VisDrone (optionnel en local)
 ```
 
 OpenCV (`opencv-python-headless`) est **inclus** dans les dépendances principales pour la géométrie parking.

@@ -22,6 +22,7 @@ dependencies = [
     "tqdm>=4.65",
     "opencv-python-headless>=4.8",
     "python-dotenv>=1.0",
+    "huggingface-hub>=0.20",
 ]
 
 [project.optional-dependencies]

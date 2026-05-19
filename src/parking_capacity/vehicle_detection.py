@@ -23,6 +23,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from parking_capacity.repo_paths import (
+    dota_finetuned_weight_candidates,
+    finetuned_french_weights,
+)
+
 import numpy as np
 from PIL import Image
 
@@ -196,18 +201,11 @@ DEFAULT_YOLO_MODEL = "yolov8s.pt"  # Ultralytics COCO (faible sur aérien)
 DEFAULT_AERIAL_HF_REPO = "mshamrai/yolov8s-visdrone"  # VisDrone (drone aérien, vraies voitures)
 DEFAULT_AERIAL_HF_FILENAME = "best.pt"
 
-# Chemin local d'un éventuel modèle fine-tuné sur chips BD ORTHO françaises
-# (self-pseudo-labeling, voir scripts/finetune_aerial_yolo.py).
-FINETUNED_FRENCH_WEIGHTS = Path(
-    "/Users/mac/Yolo/data/aerial_weights/finetuned_v1/run1/weights/best.pt"
-)
+# Fine-tuning sur chips BD ORTHO françaises (scripts/finetune_aerial_yolo.py).
+FINETUNED_FRENCH_WEIGHTS = finetuned_french_weights()
 
-# Fine-tuning sur DOTAv1 vehicles (51 700 véhicules réels annotés humainement, Wuhan University).
-# On essaie run2 (paramètres optimisés MPS), puis run1 (legacy).
-DOTA_FINETUNED_WEIGHTS_CANDIDATES = [
-    Path("/Users/mac/Yolo/data/aerial_weights/dota_finetune_v1/run2/weights/best.pt"),
-    Path("/Users/mac/Yolo/data/aerial_weights/dota_finetune_v1/run1/weights/best.pt"),
-]
+# Fine-tuning DOTAv1 vehicles : run2 puis run1.
+DOTA_FINETUNED_WEIGHTS_CANDIDATES = list(dota_finetuned_weight_candidates())
 DOTA_FINETUNED_WEIGHTS = DOTA_FINETUNED_WEIGHTS_CANDIDATES[0]  # alias historique
 
 
