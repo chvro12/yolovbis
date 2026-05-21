@@ -122,61 +122,198 @@ def run(
         help="Fichier providers.yaml pour sources GIS (IGN WFS, Overpass, …)",
     ),
     include_raw: bool = typer.Option(False, "--include-raw", help="Colonne raw_debug (json)"),
+    resume: bool = typer.Option(
+        True,
+        "--resume/--no-resume",
+        help="Reprend un run interrompu en relisant le ledger .progress.jsonl à côté de --output",
+    ),
+    max_rows: Optional[int] = typer.Option(
+        None,
+        "--max-rows",
+        help="Limite le nombre d'adresses traitées (utile pour tester sur un petit échantillon)",
+    ),
+    max_workers: int = typer.Option(
+        4,
+        "--max-workers",
+        min=1,
+        help="Nombre de threads parallèles. Le rate-limiter Overpass borne automatiquement le débit ;"
+        " mettre 1 pour rester en séquentiel (utile pour debug).",
+    ),
+    geocode_batch: bool = typer.Option(
+        True,
+        "--geocode-batch/--no-geocode-batch",
+        help="Pré-géocode toutes les adresses via BAN /search/csv avant la boucle (1 appel pour 500 adresses).",
+    ),
 ) -> None:
-    """Traite chaque ligne du CSV et écrit les résultats."""
+    """Traite chaque ligne du CSV et écrit les résultats.
+
+    Bulk friendly :
+      - le client HTTP est partagé sur toutes les adresses (connexions BAN/APICarto/Overpass/SIRENE)
+      - un ledger JSONL est écrit en append à côté de --output : reprise après interruption
+      - si --cache-dir n'est pas fourni, on bascule sur ``data/.cache_http`` pour éviter de retaper les API.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    import httpx
+    from tqdm import tqdm
+
+    from parking_capacity.geocode import batch_geocode_csv, prime_geocode_cache
+
     df = pd.read_csv(input_path)
     col = _detect_address_column(df, address_column)
 
-    rows_out: List[Dict[str, Any]] = []
-    for idx, val in enumerate(df[col].astype(str).tolist()):
-        addr = val.strip()
-        if not addr:
-            continue
-        r = process_address(
-            addr,
-            overpass_delay_s=overpass_delay,
-            search_radius_m=radius_m,
-            point_buffer_m=buffer_m,
-            min_intersection_m2=min_intersection_m2,
-            use_vision=not no_vision,
-            vision_device=vision_device,
-            chip_half_side_m=chip_half_side_m,
-            chip_pixels=chip_pixels,
-            wms_base=wms_base,
-            wms_layer=wms_layer,
-            m2_per_space=m2_per_space,
-            vision_compare=vision_compare,
-            include_raw=include_raw,
-            ml_checkpoint=ml_checkpoint,
-            ml_mode=ml_mode,
-            ml_device=ml_device,
-            cache_dir=cache_dir,
-            aerial_first=aerial_first,
-            source_priority=source_priority,
-            refresh_imagery=refresh_imagery,
-            force_ml=force_ml,
-            visual_backend=visual_backend,
-            visual_model_specialized_for_parking=visual_model_specialized,
-            yolo_weights=yolo_weights,
-            providers_yaml=providers_yaml,
-        )
-        base = row_to_json_serializable(r)
-        base["source_row_index"] = idx
-        rows_out.append(base)
-
-    out_df = pd.DataFrame(rows_out)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path = output_path.with_suffix(output_path.suffix + ".progress.jsonl")
+
+    # Cache disque par défaut en bulk : évite de retaper BAN/Overpass/WMS sur des reruns.
+    effective_cache_dir = cache_dir
+    if effective_cache_dir is None:
+        effective_cache_dir = Path("data/.cache_http")
+        typer.echo(
+            f"[bulk] --cache-dir non fourni → {effective_cache_dir} (réutilise les réponses HTTP en cache disque).",
+            err=True,
+        )
+    effective_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Reprise : on relit les indices déjà traités dans le ledger.
+    done_indices: set[int] = set()
+    if resume and ledger_path.exists():
+        with ledger_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                idx = rec.get("source_row_index")
+                if isinstance(idx, int):
+                    done_indices.add(idx)
+        if done_indices:
+            typer.echo(f"[bulk] Reprise : {len(done_indices)} adresses déjà dans {ledger_path.name}.", err=True)
+    else:
+        # Sans reprise on remet à zéro le ledger pour ne pas mélanger d'anciens runs.
+        if ledger_path.exists():
+            ledger_path.unlink()
+
+    rows_out: List[Dict[str, Any]] = []
+    addresses = df[col].astype(str).tolist()
+
+    # On présélectionne les (index, adresse) à traiter pour avoir une barre de progression cohérente.
+    todo: list[tuple[int, str]] = []
+    for idx, val in enumerate(addresses):
+        addr = val.strip()
+        if not addr or idx in done_indices:
+            continue
+        todo.append((idx, addr))
+        if max_rows is not None and len(todo) >= max_rows:
+            break
+
+    # Pré-géocodage en masse via BAN /search/csv (1 POST = jusqu'à 500 adresses).
+    # Why: évite N round-trips HTTP au début du pipeline et donne un cache mémoire partagé entre workers.
+    if geocode_batch and todo:
+        try:
+            with httpx.Client(timeout=120.0, follow_redirects=True) as ban_client:
+                prewarm = batch_geocode_csv((addr for _, addr in todo), client=ban_client)
+            if prewarm:
+                prime_geocode_cache(prewarm)
+                typer.echo(
+                    f"[bulk] Pré-géocodage BAN : {len(prewarm)}/{len(todo)} adresses résolues en batch.",
+                    err=True,
+                )
+        except Exception as e:  # noqa: BLE001
+            typer.echo(f"[bulk] Pré-géocodage BAN ignoré ({type(e).__name__}: {e}).", err=True)
+
+    # httpx est thread-safe au niveau d'un Client (selon les docs) ; chaque worker partage le pool.
+    ledger_lock = threading.Lock()
+    pbar = tqdm(total=len(todo), desc="Adresses", unit="addr")
+
+    def _worker(client: httpx.Client, idx: int, addr: str) -> Dict[str, Any]:
+        try:
+            r = process_address(
+                addr,
+                client=client,
+                overpass_delay_s=overpass_delay,
+                search_radius_m=radius_m,
+                point_buffer_m=buffer_m,
+                min_intersection_m2=min_intersection_m2,
+                use_vision=not no_vision,
+                vision_device=vision_device,
+                chip_half_side_m=chip_half_side_m,
+                chip_pixels=chip_pixels,
+                wms_base=wms_base,
+                wms_layer=wms_layer,
+                m2_per_space=m2_per_space,
+                vision_compare=vision_compare,
+                include_raw=include_raw,
+                ml_checkpoint=ml_checkpoint,
+                ml_mode=ml_mode,
+                ml_device=ml_device,
+                cache_dir=effective_cache_dir,
+                aerial_first=aerial_first,
+                source_priority=source_priority,
+                refresh_imagery=refresh_imagery,
+                force_ml=force_ml,
+                visual_backend=visual_backend,
+                visual_model_specialized_for_parking=visual_model_specialized,
+                yolo_weights=yolo_weights,
+                providers_yaml=providers_yaml,
+            )
+            base = row_to_json_serializable(r)
+        except Exception as e:  # noqa: BLE001
+            base = {"input_address": addr, "error": f"{type(e).__name__}: {e}"}
+        base["source_row_index"] = idx
+        return base
+
+    with httpx.Client(timeout=120.0, follow_redirects=True) as client, ledger_path.open("a", encoding="utf-8") as ledger:
+        if max_workers == 1:
+            for idx, addr in todo:
+                rec = _worker(client, idx, addr)
+                ledger.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+                ledger.flush()
+                rows_out.append(rec)
+                pbar.update(1)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = {ex.submit(_worker, client, idx, addr): idx for idx, addr in todo}
+                for fut in as_completed(futures):
+                    rec = fut.result()
+                    with ledger_lock:
+                        ledger.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+                        ledger.flush()
+                    rows_out.append(rec)
+                    pbar.update(1)
+    pbar.close()
+
+    # Sortie finale : on relit le ledger complet (= runs précédents + nouveau) pour produire le fichier
+    # demandé. Garantit que --resume produit le même CSV/JSONL que sans interruption.
+    all_records: List[Dict[str, Any]] = []
+    with ledger_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                all_records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    all_records.sort(key=lambda d: d.get("source_row_index", 0))
 
     if fmt == "csv":
-        out_df.to_csv(output_path, index=False)
+        pd.DataFrame(all_records).to_csv(output_path, index=False)
     elif fmt == "jsonl":
         with output_path.open("w", encoding="utf-8") as f:
-            for rec in rows_out:
+            for rec in all_records:
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
     else:
         raise typer.BadParameter("--format doit être csv ou jsonl")
 
-    typer.echo(f"Écrit : {output_path} ({len(rows_out)} lignes)")
+    typer.echo(
+        f"Écrit : {output_path} ({len(all_records)} lignes ; "
+        f"+{len(rows_out)} ce run ; ledger : {ledger_path.name})"
+    )
 
 
 @app.command("run-address")

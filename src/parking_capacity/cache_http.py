@@ -73,6 +73,36 @@ def save_cached_response(
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def get_with_cache(
+    client: httpx.Client,
+    url: str,
+    *,
+    params: Optional[dict] = None,
+    cache_dir: Optional[Path] = None,
+    ttl_s: float = DEFAULT_TTL_S,
+    max_retries: int = 3,
+    user_agent: str = "parking-capacity/0.1 (+https://github.com/)",
+) -> httpx.Response:
+    # On compose une URL canonique pour la clé de cache.
+    req = httpx.Request("GET", url, params=params)
+    canonical_url = str(req.url)
+    cached = load_cached_response(cache_dir, method="GET", url=canonical_url, body=None, ttl_s=ttl_s)
+    if cached is not None:
+        return httpx.Response(200, content=cached)
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_retries):
+        try:
+            r = client.get(url, params=params, headers={"User-Agent": user_agent})
+            r.raise_for_status()
+            save_cached_response(cache_dir, method="GET", url=canonical_url, body=None, content=r.content)
+            return r
+        except httpx.HTTPError as e:
+            last_exc = e
+            time.sleep(0.8 * (attempt + 1))
+    raise last_exc  # type: ignore[misc]
+
+
 def post_with_cache(
     client: httpx.Client,
     url: str,

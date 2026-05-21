@@ -312,7 +312,7 @@ def process_address(
         if g.score < 0.5:
             caveats.append("Score BAN faible : vérifier la géolocalisation.")
 
-        parcel_hits = fetch_parcelles(g.lon, g.lat, client=client)
+        parcel_hits = fetch_parcelles(g.lon, g.lat, client=client, cache_dir=cache_dir)
         parcel_union = merge_parcelles_geometries(parcel_hits)
         if parcel_union is None:
             caveats.append("Aucune parcelle cadastrale renvoyée par APICarto pour ce point.")

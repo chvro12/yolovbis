@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,24 @@ from parking_capacity.cache_http import post_with_cache
 
 OVERPASS_DEFAULT_URL = "https://overpass-api.de/api/interpreter"
 logger = logging.getLogger(__name__)
+
+# Rate-limiter partagé Overpass : garantit au plus 1 requête / delay_s à travers tous les threads.
+# Why: les workers parallèles déclencheraient sinon des bursts qui font bannir l'IP par Overpass.
+_OVERPASS_LOCK = threading.Lock()
+_OVERPASS_NEXT_ALLOWED: float = 0.0
+
+
+def _overpass_throttle(delay_s: float) -> None:
+    if delay_s <= 0:
+        return
+    global _OVERPASS_NEXT_ALLOWED
+    with _OVERPASS_LOCK:
+        now = time.monotonic()
+        wait = _OVERPASS_NEXT_ALLOWED - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        _OVERPASS_NEXT_ALLOWED = now + delay_s
 
 
 @dataclass
@@ -164,8 +183,7 @@ def query_parkings(
     cache_dir: Optional[Path] = None,
     max_retries: int = 3,
 ) -> tuple[list[OsmParkingElement], dict[str, Any]]:
-    if delay_s > 0:
-        time.sleep(delay_s)
+    _overpass_throttle(delay_s)
     q = build_overpass_query(lat, lon, radius_m)
     own_client = client is None
     if own_client:
@@ -196,8 +214,7 @@ def query_parking_space_count(
     cache_dir: Optional[Path] = None,
     max_retries: int = 3,
 ) -> tuple[int, dict[str, Any]]:
-    if delay_s > 0:
-        time.sleep(delay_s)
+    _overpass_throttle(delay_s)
     q = build_overpass_parking_space_count(lat, lon, radius_m)
     own_client = client is None
     if own_client:
@@ -233,8 +250,7 @@ def query_parkings_bbox_capacity(
     max_retries: int = 3,
 ) -> tuple[list[OsmParkingElement], dict[str, Any]]:
     """Parkings avec tag capacity dans une bbox WGS84 (min_lon, min_lat, max_lon, max_lat)."""
-    if delay_s > 0:
-        time.sleep(delay_s)
+    _overpass_throttle(delay_s)
     q = build_overpass_bbox_parking_capacity(min_lon, min_lat, max_lon, max_lat)
     own_client = client is None
     if own_client:

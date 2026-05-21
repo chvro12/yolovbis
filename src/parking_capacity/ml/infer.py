@@ -47,12 +47,26 @@ def _pil_to_model_input(image: Image.Image, img_size: int) -> torch.Tensor:
     return t
 
 
+_REGRESSOR_CACHE: Dict[Tuple[str, float, str], Tuple[torch.nn.Module, Dict[str, Any], torch.device]] = {}
+
+
+def _resolve_device(device_str: str | None) -> torch.device:
+    return torch.device(device_str or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+
 def load_regressor(
     checkpoint: Path,
     *,
     device_str: str | None = None,
 ) -> Tuple[torch.nn.Module, Dict[str, Any], torch.device]:
     checkpoint = Path(checkpoint)
+    device = _resolve_device(device_str)
+    # Cache key: chemin résolu + mtime (invalide si le fichier change) + device.
+    cache_key = (str(checkpoint.resolve()), checkpoint.stat().st_mtime, str(device))
+    cached = _REGRESSOR_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     cfg = read_inference_config(checkpoint)
     arch = str(cfg.get("architecture", "tiny"))
     if arch not in ARCHITECTURES:
@@ -64,10 +78,10 @@ def load_regressor(
         raise ValueError("Checkpoint invalide : clé state_dict manquante")
     model = build_model(arch, pretrained=False)  # type: ignore[arg-type]
     model.load_state_dict(payload["state_dict"])
-    device = torch.device(device_str or ("cuda" if torch.cuda.is_available() else "cpu"))
     model.to(device)
     model.train(False)
     meta = {**cfg, "architecture": arch, "img_size": img_size}
+    _REGRESSOR_CACHE[cache_key] = (model, meta, device)
     return model, meta, device
 
 

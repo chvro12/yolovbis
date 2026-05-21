@@ -11,16 +11,20 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, List, Tuple
+from pathlib import Path
+from typing import Any, Iterable, Iterator, List, Optional, Tuple
 
 import httpx
 from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
 
+from parking_capacity.cache_http import get_with_cache
+
 APICARTO_PARCELLE_URL = "https://apicarto.ign.fr/api/cadastre/parcelle"
 
-# Décalages légers (m) : le point BAN peut tomber sur une limite / hors parcelle alors qu’un voisin proche intersecte.
-_DEFAULT_JITTER_M: Tuple[float, ...] = (0.0, 3.0, 5.0, 8.0, 12.0, 20.0)
+# Décalages (m) : le point BAN peut tomber sur une limite / hors parcelle alors qu’un voisin proche intersecte.
+# Profil par défaut allégé pour le bulk : 3 anneaux au lieu de 6 → ~19 appels max au lieu de ~46 dans le pire cas.
+_DEFAULT_JITTER_M: Tuple[float, ...] = (0.0, 5.0, 15.0)
 
 
 @dataclass
@@ -94,11 +98,16 @@ def _parse_feature_collection(fc: Any) -> List[ParcelleHit]:
     return hits
 
 
-def _fetch_parcelles_at_point(lon: float, lat: float, *, client: httpx.Client) -> list[ParcelleHit]:
+def _fetch_parcelles_at_point(
+    lon: float,
+    lat: float,
+    *,
+    client: httpx.Client,
+    cache_dir: Optional[Path] = None,
+) -> list[ParcelleHit]:
     geom = {"type": "Point", "coordinates": [lon, lat]}
     params = {"geom": json.dumps(geom, separators=(",", ":"))}
-    r = client.get(APICARTO_PARCELLE_URL, params=params)
-    r.raise_for_status()
+    r = get_with_cache(client, APICARTO_PARCELLE_URL, params=params, cache_dir=cache_dir)
     return _parse_feature_collection(r.json())
 
 
@@ -108,12 +117,13 @@ def fetch_parcelles(
     *,
     client: httpx.Client | None = None,
     jitter_m: Iterable[float] | None = None,
+    cache_dir: Optional[Path] = None,
 ) -> list[ParcelleHit]:
     """
     Interroge APICarto parcelle pour un point (lon, lat) en WGS84.
 
     Si la réponse est vide (point sur limite, décalage BAN, etc.), réessaie avec de légers
-    décalages en mètres autour du point.
+    décalages en mètres autour du point. ``cache_dir`` active le cache disque GET (utile en bulk).
     """
     jit = tuple(jitter_m) if jitter_m is not None else _DEFAULT_JITTER_M
 
@@ -122,7 +132,7 @@ def fetch_parcelles(
         client = httpx.Client(timeout=30.0)
     try:
         for lo, la in iter_parcel_query_points(lon, lat, jitter_m=jit):
-            hits = _fetch_parcelles_at_point(lo, la, client=client)
+            hits = _fetch_parcelles_at_point(lo, la, client=client, cache_dir=cache_dir)
             if hits:
                 return hits
         return []
